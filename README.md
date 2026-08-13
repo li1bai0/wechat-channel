@@ -10,6 +10,7 @@
 
 - **真正的 Agent 无关**：不只内置 Codex / Claude Code，任何能把回答打到标准输出的 CLI 都能接（OpenCode、Gemini、Qwen Code、Aider……或你自己的脚本），配置两行命令即可
 - **远程实时看进度**：大型任务先报计划，每完成一步微信立刻收到一声，最后总结——不用守着电脑干等
+- **常驻连接**：Codex app-server 常驻进程 + 桥保持长连接，不每条消息重启，回复更快
 - **中文使用习惯**：说「停」「等等」就打断，「历史会话」看记录，「切回第3个」切换，「继续」接着聊
 - **文件双向互传**：微信发文件给 Agent，Agent 产出文件自动发回微信
 - **为长期运行而生**：熔断、自动重连重绑、发送失败落盘重试、看门狗，掉线自动恢复
@@ -23,13 +24,14 @@
 - 文件互传：微信发文件/图片给 Agent；Agent 产出的文件自动发回微信（AES-128-ECB，上限 50MB）
 - 会话管理：/sessions 列表、/resume N 切回、/new 开新会话
 - 稳定性加固：熔断器+指数退避、会话过期自动重出二维码、发送失败落盘重试、轮询看门狗、单实例锁、单一 bot 稳定连接
+- 常驻连接：Codex app-server 常驻，桥保持 WebSocket 长连接，不每条消息重启，回复延迟从约 20s 降到约 6s
 - 指令：/stop 打断任务、/status 查看通道状态
 
 ## 支持的 Agent
 
 | Agent | 新会话 | 续接会话 | 说明 |
 |---|---|---|---|
-| Codex（内置） | `codex exec "{prompt}"` | `codex exec resume <sid> "{prompt}"` | 已实测 |
+| Codex（内置） | 常驻 app-server（WebSocket） | 同一线程续聊 | 已实测 |
 | Claude Code（内置） | `claude -p "{prompt}" --output-format stream-json --include-partial-messages --dangerously-skip-permissions` | 加 `--resume <sid>` | 已实测，流式进度 |
 | OpenCode | `opencode run "{prompt}"` | `opencode run -s <sid> "{prompt}"` | 非交互自动放行权限 |
 | Qwen Code | `qwen -p "{prompt}"` | `qwen --resume <sid> -p "{prompt}"` | 加 `--yolo` 自动放行工具 |
@@ -44,7 +46,7 @@
 ```text
 手机微信 ⇄ iLink Bot API（官方通道） ⇄ 本机桥（wechat_bridge.py） ⇄ Agent CLI
                                                     │
-                                                    ├─ codex exec / exec resume
+                                                    ├─ codex app-server（常驻 WebSocket）
                                                     ├─ claude -p --output-format stream-json
                                                     └─ generic（自定义命令模板）
 ```

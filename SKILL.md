@@ -9,6 +9,7 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 
 - 微信 AI 通道：`scripts/wechat_bridge.py` 是「微信桥」，用户微信私聊机器人 → iLink Bot API → 本机 Agent CLI（Codex / Claude / 任意 CLI）生成回复 → 回发微信。
 - 微信 bot 只服务扫码绑定的那个微信号。
+- 常驻连接：Codex app-server 常驻进程，桥保持 WebSocket 长连接，不每条消息重启 Codex（回复更快，续聊复用同一线程）。
 - 关键路径：
   - 桥脚本：`scripts/wechat_bridge.py`
   - 桥数据目录：`weixin_bridge/`（`account.json`、`state.json`、`bridge.log`、`backend.json`）
