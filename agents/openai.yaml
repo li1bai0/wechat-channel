@@ -1,0 +1,4 @@
+interface:
+  display_name: "微信通道"
+  short_description: "排查并恢复 Codex 微信 AI 回复通道（断连/会话过期/重绑）"
+  default_prompt: "Use $wechat-channel to check why WeChat replies stopped and restore the Codex bridge."
