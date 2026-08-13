@@ -423,13 +423,23 @@ def _drain_retry_queue():
 # ───────────────────────── 单实例锁 ─────────────────────────
 
 def _pid_alive(pid):
+    """判断 pid 是否仍为运行中的桥进程（防 PID 复用误判）。"""
     try:
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not h:
             return False
         ctypes.windll.kernel32.CloseHandle(h)
-        return True
+    except Exception:
+        return False
+    try:
+        out = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        cl = out.stdout.decode("utf-8", errors="replace").lower()
+        return "python" in cl and "wechat_bridge" in cl
     except Exception:
         return False
 
@@ -619,6 +629,7 @@ def _extract_files(reply):
 
 def codex_reply(prompt, session_id=None, on_progress=None):
     """通过常驻 app-server 连接生成回复（不每条消息重启 Codex）。"""
+    global _helper_proc
     if not _probe_codex_provider():
         log("⚠️ Codex 模型服务不可达（本地代理未启动），跳过本轮")
         return None, session_id
@@ -660,15 +671,20 @@ def codex_reply(prompt, session_id=None, on_progress=None):
                     raise RuntimeError(obj.get("message") or "turn error")
             raise RuntimeError("回复超时")
         except Exception as e:
-            log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {str(e)[:120]}")
-            with _helper_lock:
-                if _helper_proc:
-                    try:
-                        _helper_proc.kill()
-                    except Exception:
-                        pass
-                    _helper_proc = None
-            time.sleep(3)
+            msg = str(e)
+            log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {msg[:120]}")
+            if "thread not found" in msg:
+                log("🧹 旧线程失效，自动开新线程重试")
+                session_id = None
+            else:
+                with _helper_lock:
+                    if _helper_proc:
+                        try:
+                            _helper_proc.kill()
+                        except Exception:
+                            pass
+                        _helper_proc = None
+                time.sleep(3)
     return None, session_id
 
 
