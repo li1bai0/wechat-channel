@@ -76,6 +76,7 @@ _DEFAULT_CODEX_JS = ""  # 留空则自动探测（见 _resolve_tool_paths）
 _DEFAULT_CLAUDE_EXE = ""
 _DEFAULT_WORK_DIR = ""  # 留空则用仓库根目录下的 wechat_work/
 REPLY_TIMEOUT = 600
+TURN_HANG_TIMEOUT = 120   # 常驻连接单轮无任何事件超过此秒数视为卡死，自动打断重试
 BACKEND_FILE = DATA_DIR / "backend.json"
 DEFAULT_BACKEND = "codex"
 BACKEND_IDENTITY = {"codex": "Codex", "claude": "Claude", "generic": "AI 助手"}
@@ -646,10 +647,21 @@ def codex_reply(prompt, session_id=None, on_progress=None):
                        "prompt": prompt, "cwd": CODEX_WORK_DIR}
             if not _helper_send(payload):
                 raise RuntimeError("助手未连接")
-            deadline = time.time() + REPLY_TIMEOUT
-            while time.time() < deadline:
+            last_event = time.time()
+            while True:
                 if _cancel_event.is_set():
                     return None, session_id
+                if time.time() - last_event > TURN_HANG_TIMEOUT:
+                    try:
+                        _helper_send({"type": "interrupt"})
+                    except Exception:
+                        pass
+                    if on_progress:
+                        try:
+                            on_progress("（任务好像卡住了，我重启一下再试）")
+                        except Exception:
+                            pass
+                    raise RuntimeError("单轮卡死（无事件超时）")
                 line = _helper_out.readline()
                 if not line:
                     raise RuntimeError("助手退出")
@@ -657,6 +669,7 @@ def codex_reply(prompt, session_id=None, on_progress=None):
                     obj = json.loads(line)
                 except Exception:
                     continue
+                last_event = time.time()
                 t = obj.get("type")
                 if t == "progress" and on_progress:
                     try:
@@ -669,7 +682,6 @@ def codex_reply(prompt, session_id=None, on_progress=None):
                     return reply or None, obj.get("threadId") or session_id
                 elif t == "error":
                     raise RuntimeError(obj.get("message") or "turn error")
-            raise RuntimeError("回复超时")
         except Exception as e:
             msg = str(e)
             log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {msg[:120]}")
@@ -1292,11 +1304,9 @@ class Bridge:
                 sid = self.state.get("codex_session")
                 identity = BACKEND_IDENTITY.get(self.backend, "Codex")
                 prompt = (PRIMER.format(identity=identity) if not sid else "") + SYSTEM_HINT.format(identity=identity) + text
-                on_progress = None
+                on_progress = self.send_weixin
                 if level == "complex":
                     prompt += TASK_PROTOCOL
-                    def on_progress(msg):
-                        self.send_weixin(msg)
                 reply, sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
                                          cfg=self.backend_cfg)
                 self.state["codex_session"] = sid
