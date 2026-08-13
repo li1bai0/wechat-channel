@@ -1,15 +1,15 @@
 #!/usr/bin/env node
-/* Codex app-server 常驻连接助手：桥保持一条 WS 长连接，避免每条消息重启 Codex。
+/* Codex app-server 常驻连接助手（支持并发多 turn）。
  *
  * stdin 协议（JSON 行）：
  *   {"type":"turn","id":1,"threadId":null|"uuid","prompt":"...","cwd":"...","effort":"high"|null}
  *   {"type":"interrupt"}
  * stdout 协议（JSON 行）：
  *   {"type":"ready"}
- *   {"type":"progress","text":"..."}      # 【计划】/【进度】标记行
- *   {"type":"delta","text":"..."}          # 流式文本片段（可选）
- *   {"type":"result","text":"...","threadId":"...","id":1}
- *   {"type":"error","message":"...","id":1}
+ *   {"type":"progress","text":"...","id":N}   # 【计划】/【进度】标记行
+ *   {"type":"delta","text":"...","id":N}       # 流式文本片段
+ *   {"type":"result","text":"...","threadId":"...","id":N}
+ *   {"type":"error","message":"...","id":N}
  */
 import readline from "node:readline";
 
@@ -19,7 +19,7 @@ const WS_READY_TIMEOUT_MS = 30000;
 let ws = null;
 let nextId = 1;
 const pending = new Map();
-let cur = { threadId: null, turnId: null, buffer: "", sent: new Set(), reqId: null };
+const turns = new Map(); // turnId -> { reqId, threadId, buffer, linebuf, sent }
 
 function out(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -40,17 +40,20 @@ function connect() {
     ws.onopen = () => { clearTimeout(timer); resolve(); };
     ws.onerror = (e) => { clearTimeout(timer); reject(new Error(String((e && e.message) || e))); };
     ws.onmessage = (ev) => handle(JSON.parse(ev.data));
-    ws.onclose = () => { /* 进程退出由桥侧守护处理 */ };
+    ws.onclose = () => {};
   });
 }
 
-function scanProgress(text) {
-  for (const line of text.split("\n")) {
-    const l = line.trim();
+function scanProgress(st, text) {
+  st.linebuf += text || "";
+  const lines = st.linebuf.split("\n");
+  st.linebuf = lines.pop();
+  for (const raw of lines) {
+    const l = raw.trim();
     const m = l.match(/【(计划|进度)】\s*(.+)/);
-    if (m && !cur.sent.has(l) && !l.includes("步骤描述") && !l.includes("自动转发")) {
-      cur.sent.add(l);
-      out({ type: "progress", text: (m[1] === "计划" ? "📋 " : "✅ ") + m[2].trim() });
+    if (m && !st.sent.has(l) && !l.includes("步骤描述") && !l.includes("自动转发")) {
+      st.sent.add(l);
+      out({ type: "progress", text: (m[1] === "计划" ? "📋 " : "✅ ") + m[2].trim(), id: st.reqId });
     }
   }
 }
@@ -66,32 +69,33 @@ function handle(msg) {
   const method = msg.method || "";
   const params = msg.params || {};
   if (method === "item/agentMessage/delta") {
-    const d = params.delta || "";
-    cur.buffer += d;
-    out({ type: "delta", text: d });
-    scanProgress(d);
-  } else if (method === "turn/started") {
-    cur.turnId = params.turnId || null;
+    const st = turns.get(params.turnId);
+    if (st) {
+      const d = params.delta || "";
+      st.buffer += d;
+      out({ type: "delta", text: d, id: st.reqId });
+      scanProgress(st, d);
+    }
   } else if (method === "turn/completed") {
-    const text = cur.buffer.trim();
-    const reqId = cur.reqId;
-    cur.buffer = "";
-    cur.sent = new Set();
-    cur.turnId = null;
-    cur.reqId = null;
-    out({ type: "result", text, threadId: cur.threadId, id: reqId });
+    const turn = params.turn || {};
+    const st = turns.get(turn.id);
+    if (st) {
+      scanProgress(st, "\n"); // 冲刷缓冲，补扫最后一行
+      out({ type: "result", text: st.buffer.trim(), threadId: st.threadId, id: st.reqId });
+      turns.delete(turn.id);
+    }
   } else if (method === "turn/error" || method === "error") {
-    const reqId = cur.reqId;
-    cur.buffer = "";
-    cur.reqId = null;
-    out({ type: "error", message: String((params && (params.message || params.error)) || method), id: reqId });
+    const turnId = (params.turn || {}).id;
+    const st = turns.get(turnId);
+    if (st) {
+      out({ type: "error", message: String((params && (params.message || params.error)) || method), id: st.reqId });
+      turns.delete(turnId);
+    }
   }
 }
 
 async function startTurn(cmd) {
-  cur.sent = new Set();
-  cur.buffer = "";
-  cur.reqId = cmd.id ?? null;
+  const reqId = cmd.id ?? null;
   let threadId = cmd.threadId || null;
   try {
     if (!threadId) {
@@ -101,9 +105,6 @@ async function startTurn(cmd) {
         sandbox: "danger-full-access",
       });
       threadId = started.thread.id || started.thread || started.id;
-      cur.threadId = threadId;
-    } else {
-      cur.threadId = threadId;
     }
     const params = {
       threadId,
@@ -112,9 +113,15 @@ async function startTurn(cmd) {
       sandboxPolicy: { type: "dangerFullAccess" },
     };
     if (cmd.effort) params.effort = cmd.effort;
-    await rpc("turn/start", params);
+    const res = await rpc("turn/start", params);
+    const turnId = res.turn && res.turn.id;
+    if (turnId) {
+      turns.set(turnId, { reqId, threadId, buffer: "", linebuf: "", sent: new Set() });
+    } else {
+      out({ type: "error", message: "turn/start 未返回 turn.id", id: reqId });
+    }
   } catch (e) {
-    out({ type: "error", message: String(e.message || e), id: cmd.id ?? null });
+    out({ type: "error", message: String(e.message || e), id: reqId });
   }
 }
 
@@ -122,10 +129,11 @@ const rl = readline.createInterface({ input: process.stdin, terminal: false });
 rl.on("line", async (line) => {
   let cmd;
   try { cmd = JSON.parse(line); } catch { return; }
-  if (cmd.type === "turn") await startTurn(cmd);
-  else if (cmd.type === "interrupt") {
-    if (cur.threadId && cur.turnId) {
-      try { await rpc("turn/interrupt", { threadId: cur.threadId, turnId: cur.turnId }); } catch {}
+  if (cmd.type === "turn") {
+    await startTurn(cmd);
+  } else if (cmd.type === "interrupt") {
+    for (const [turnId, st] of turns.entries()) {
+      try { await rpc("turn/interrupt", { threadId: st.threadId, turnId }); } catch {}
     }
   }
 });

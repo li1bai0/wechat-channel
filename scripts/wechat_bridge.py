@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WeChat Agent Bridge（多后端稳定性加固版）— iLink Bot API ↔ Agent CLI
+Codex 微信桥（专线版 v2 — 稳定性加固）— iLink Bot API ↔ Codex CLI
 
-微信 bot 只服务扫码绑定的那个微信用户，回复由本机 Agent CLI（Codex / Claude /
-任意命令行 Agent）生成。稳定性设计要点：
+用户微信专线：微信 bot 只服务扫码绑定的那个用户，回复由本机 Agent CLI 生成。
+按长期稳定运行的单一 bot 连接经验设计：单一 bot 稳定连接、无自动轮换：
   1. 熔断器 + 指数退避 + 抖动：瞬时错误不再线性傻等，连续失败跳闸 OPEN
   2. 会话过期(-14 / ret=-2+"unknown error")：
-     - 暂停 10 分钟 → 重置熔断 → 自动重试
+     - 暂停 10 分钟 → 重置熔断 → 自动重试（不再无限 300s 干等）
      - 发送时先去掉 context_token 重试一次
-     - 自动生成新二维码并保存 PNG + 可选总线通告，等用户扫码；不自动切换其他账号
+     - 自动生成新二维码并保存 PNG + 总线通告，等你扫码；不自动切换其他账号
      - 检测到 account.json 被重新注册覆盖后自动热加载新账号
   3. 发送失败持久化 retry_queue.jsonl，启动自动排空重发（防丢消息）
   4. 单实例锁（防双进程并发轮询同一 bot 被服务端踢）
-  5. 轮询悬挂看门狗：同步轮询整段卡死超时后自杀，交给守护拉起
+  5. 轮询悬挂看门狗：同步轮询整段卡死超时后自杀，交给看护拉起
   6. 重绑后自动清空旧账号的 codex_session/context_token 残留
 
 用法：
@@ -26,6 +26,7 @@ import base64
 import hashlib
 import json
 import os
+import queue
 import random
 import re
 import shlex
@@ -76,7 +77,7 @@ _DEFAULT_CODEX_JS = ""  # 留空则自动探测（见 _resolve_tool_paths）
 _DEFAULT_CLAUDE_EXE = ""
 _DEFAULT_WORK_DIR = ""  # 留空则用仓库根目录下的 wechat_work/
 REPLY_TIMEOUT = 600
-TURN_HANG_TIMEOUT = 120   # 常驻连接单轮无任何事件超过此秒数视为卡死，自动打断重试
+TURN_HANG_TIMEOUT = 90    # 常驻连接单轮无任何事件超过此秒数视为卡死，静默自愈重试
 BACKEND_FILE = DATA_DIR / "backend.json"
 DEFAULT_BACKEND = "codex"
 BACKEND_IDENTITY = {"codex": "Codex", "claude": "Claude", "generic": "AI 助手"}
@@ -109,7 +110,7 @@ def _resolve_tool_paths():
                 claude_exe = cand
                 break
     if not work_dir:
-        work_dir = str(Path(__file__).resolve().parent.parent / "wechat_work")
+        work_dir = _DEFAULT_WORK_DIR
     Path(work_dir).mkdir(parents=True, exist_ok=True)
     return node_exe, codex_js, claude_exe, work_dir
 
@@ -124,9 +125,14 @@ CB_BASE_DELAY = 5.0               # 指数退避基数
 CB_MAX_DELAY = 60.0               # 退避上限
 CB_JITTER = 0.5                   # ±50% 抖动
 SESSION_EXPIRED_PAUSE = 600       # 会话过期暂停秒数（10 分钟）
-HANG_TIMEOUT_S = 300               # 轮询悬挂看门狗阈值
+HANG_TIMEOUT_S = 180               # 轮询悬挂看门狗阈值（更快的卡死检测）
 FLUSH_RETRY_INTERVAL = 30          # 重试队列排空周期
 REBIND_ATTEMPT_COOLDOWN = 3600     # 自动重绑二维码触发冷却
+EXPIRY_REBIND_THRESHOLD = 6        # 连续 -14 轮数（约 1 小时）后才判定真失效，触发重绑提醒
+SEND_RATE_LIMIT = 8                # 微信侧约 10 条/分钟上限，留余量主动限流
+SEND_RATE_WINDOW = 60              # 限流窗口秒数
+MAX_MSG_LEN = 4000                 # 单条微信消息长度上限（markdown 感知分片）
+POLL_TIMEOUT = 45                  # getupdates 长轮询默认超时秒数（跟随服务端 longpolling_timeout_ms 调整）
 
 SYSTEM_HINT = ("你是{identity}，正在微信里和用户私聊。像日常聊天一样自然回复："
                "口语化、直接、一两句话（内容需要时可以稍长），不要markdown列表、"
@@ -286,7 +292,7 @@ def log(msg):
         pass
     try:
         DATA_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
+        with open(LOG_FILE, "a", encoding="utf-8", errors="replace") as f:
             f.write(line + "\n")
     except Exception:
         pass
@@ -315,6 +321,18 @@ def bus_notice(content):
         _req(BUS_SEND, {"agent": "Codex桥", "content": content})
     except Exception:
         pass
+
+
+def _toast(title, text):
+    """右下角 Windows Toast 通知（不阻塞、不影响任务）。"""
+    try:
+        subprocess.Popen(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden",
+                          "-ExecutionPolicy", "Bypass", "-File",
+                          _TOAST_PS1,
+                          "-Title", title, "-Text", text],
+                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception as e:
+        log(f"Toast 提醒失败: {str(e)[:80]}")
 
 
 def _is_stale_session_ret(ret, errcode, errmsg):
@@ -425,22 +443,23 @@ def _drain_retry_queue():
 
 def _pid_alive(pid):
     """判断 pid 是否仍为运行中的桥进程（防 PID 复用误判）。"""
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
     try:
-        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not h:
             return False
-        ctypes.windll.kernel32.CloseHandle(h)
-    except Exception:
-        return False
-    try:
-        out = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command",
-             f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"],
-            capture_output=True, timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        cl = out.stdout.decode("utf-8", errors="replace").lower()
-        return "python" in cl and "wechat_bridge" in cl
+        try:
+            exit_code = ctypes.c_ulong()
+            ok = ctypes.windll.kernel32.GetExitCodeProcess(h, ctypes.byref(exit_code))
+            if not ok or exit_code.value != STILL_ACTIVE:
+                return False
+            buf = ctypes.create_unicode_buffer(512)
+            n = ctypes.windll.psapi.GetProcessImageFileNameW(h, buf, 512)
+            name = buf.value.lower() if n else ""
+            return "pythonw.exe" in name or "python.exe" in name
+        finally:
+            ctypes.windll.kernel32.CloseHandle(h)
     except Exception:
         return False
 
@@ -544,10 +563,17 @@ def _probe_codex_provider(timeout=5):
 _APP_SERVER_PORT = 38123
 _APP_SERVER_URL = f"ws://127.0.0.1:{_APP_SERVER_PORT}"
 _HELPER_JS = str(Path(__file__).resolve().parent / "codex_ws_helper.mjs")
+_TOAST_PS1 = str(Path(__file__).resolve().parent / "show_toast.ps1")
+_app_server_proc = None
 _helper_proc = None
 _helper_in = None
 _helper_out = None
+_helper_q = queue.Queue()
+_helper_reader = None
 _helper_lock = threading.Lock()
+_state_lock = threading.Lock()
+_active_turns = set()
+_active_turns_lock = threading.Lock()
 
 
 def _port_listening(port, host="127.0.0.1"):
@@ -560,13 +586,15 @@ def _port_listening(port, host="127.0.0.1"):
 
 
 def _ensure_app_server():
-    """确保 Codex app-server 常驻服务在跑（常驻进程，不每条消息重启）。"""
+    """确保 Codex app-server 常驻服务在跑（常驻进程）。"""
+    global _app_server_proc
     if _port_listening(_APP_SERVER_PORT):
         return True
     log("🔄 启动 Codex app-server 常驻服务…")
-    subprocess.Popen([CODEX_NODE, CODEX_JS, "app-server", "--listen", _APP_SERVER_URL],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    _app_server_proc = subprocess.Popen(
+        [CODEX_NODE, CODEX_JS, "app-server", "--listen", _APP_SERVER_URL],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     for _ in range(20):
         time.sleep(1)
         if _port_listening(_APP_SERVER_PORT):
@@ -574,9 +602,50 @@ def _ensure_app_server():
     return False
 
 
+def _helper_restart():
+    """卡死自愈：杀掉助手与 app-server，整体重拉（静默，不打扰用户）。"""
+    global _helper_proc, _helper_in, _helper_out, _helper_q, _helper_reader, _app_server_proc
+    with _helper_lock:
+        if _helper_proc:
+            try:
+                _helper_proc.kill()
+            except Exception:
+                pass
+            _helper_proc = None
+            _helper_in = None
+            _helper_out = None
+            _helper_q = queue.Queue()
+            _helper_reader = None
+        if _app_server_proc and _app_server_proc.poll() is None:
+            try:
+                _app_server_proc.kill()
+            except Exception:
+                pass
+            _app_server_proc = None
+    time.sleep(3)
+    return _helper_ensure()
+
+
+def _helper_start_reader():
+    """常驻读线程：把助手 stdout 事件推入队列（消除阻塞 readline 导致超时失效的问题）。"""
+    global _helper_reader
+
+    def _read():
+        for line in iter(_helper_out.readline, ""):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            _helper_q.put(obj)
+        _helper_q.put({"type": "exit"})
+
+    _helper_reader = threading.Thread(target=_read, daemon=True)
+    _helper_reader.start()
+
+
 def _helper_ensure():
     """确保 WS 连接助手常驻（等待 ready）。"""
-    global _helper_proc, _helper_in, _helper_out
+    global _helper_proc, _helper_in, _helper_out, _helper_q
     if _helper_proc and _helper_proc.poll() is None:
         return True
     if not _ensure_app_server():
@@ -591,24 +660,32 @@ def _helper_ensure():
                                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         _helper_in = _helper_proc.stdin
         _helper_out = _helper_proc.stdout
+        _helper_q = queue.Queue()
     except Exception as e:
         log(f"助手启动失败: {str(e)[:120]}")
         return False
+    _helper_start_reader()
     deadline = time.time() + 30
     while time.time() < deadline:
-        line = _helper_out.readline()
-        if not line:
-            return False
         try:
-            obj = json.loads(line)
-        except Exception:
+            obj = _helper_q.get(timeout=5)
+        except queue.Empty:
             continue
-        if obj.get("type") == "ready":
+        t = obj.get("type")
+        if t == "ready":
             log("✅ Codex 常驻连接就绪")
             return True
-        if obj.get("type") == "error":
+        if t == "exit":
+            log("⚠️ 助手进程退出")
+            return False
+        if t == "error":
             log(f"助手初始化错误: {obj.get('message')}")
             return False
+    log("⚠️ 助手 ready 超时，已终止")
+    try:
+        _helper_proc.kill()
+    except Exception:
+        pass
     return False
 
 
@@ -628,13 +705,74 @@ def _extract_files(reply):
     return cleaned, files
 
 
+def _split_weixin_text(text, max_len=MAX_MSG_LEN):
+    """markdown 感知分片：代码块整体一个单元，单元打包成 ≤max_len 的分片，超长单元拆围栏硬切。"""
+    text = str(text or "")
+    if not text:
+        return []
+    if len(text) <= max_len and "\n" not in text:
+        return [text]
+    lines = text.split("\n")
+    units = []
+    i, n = 0, len(lines)
+    while i < n:
+        if lines[i].strip().startswith("```"):
+            block = [lines[i]]
+            i += 1
+            while i < n and not lines[i].strip().startswith("```"):
+                block.append(lines[i])
+                i += 1
+            if i < n:
+                block.append(lines[i])
+                i += 1
+            units.append("\n".join(block))
+        else:
+            units.append(lines[i])
+            i += 1
+
+    chunks = []
+    buf = []
+    buf_len = 0
+
+    def flush():
+        nonlocal buf, buf_len
+        if buf:
+            chunks.append("\n".join(buf))
+            buf, buf_len = [], 0
+
+    for u in units:
+        if len(u) > max_len:
+            flush()
+            if u.strip().startswith("```"):
+                open_line, rest = u.split("\n", 1)
+                close = ""
+                if rest.rstrip().endswith("```"):
+                    rest = rest.rstrip()[:-3].rstrip("\n")
+                    close = "```"
+                chunks.append(open_line)
+                for j in range(0, len(rest), max_len - 8):
+                    chunks.append(rest[j:j + max_len - 8])
+                if close:
+                    chunks.append(close)
+            else:
+                for j in range(0, len(u), max_len):
+                    chunks.append(u[j:j + max_len])
+            continue
+        if buf_len + len(u) + 1 > max_len:
+            flush()
+        buf.append(u)
+        buf_len += len(u) + 1
+    flush()
+    return [c for c in chunks if c]
+
+
 def codex_reply(prompt, session_id=None, on_progress=None):
     """通过常驻 app-server 连接生成回复（不每条消息重启 Codex）。"""
     global _helper_proc
     if not _probe_codex_provider():
         log("⚠️ Codex 模型服务不可达（本地代理未启动），跳过本轮")
         return None, session_id
-    for attempt in range(2):
+    for attempt in range(3):
         _cancel_event.clear()
         with _helper_lock:
             ok = _helper_ensure()
@@ -656,21 +794,17 @@ def codex_reply(prompt, session_id=None, on_progress=None):
                         _helper_send({"type": "interrupt"})
                     except Exception:
                         pass
-                    if on_progress:
-                        try:
-                            on_progress("（任务好像卡住了，我重启一下再试）")
-                        except Exception:
-                            pass
-                    raise RuntimeError("单轮卡死（无事件超时）")
-                line = _helper_out.readline()
-                if not line:
-                    raise RuntimeError("助手退出")
+                    raise RuntimeError("HANG: 单轮无事件超时")
                 try:
-                    obj = json.loads(line)
-                except Exception:
+                    obj = _helper_q.get(timeout=5)
+                except queue.Empty:
                     continue
                 last_event = time.time()
                 t = obj.get("type")
+                if t == "exit":
+                    raise RuntimeError("助手退出")
+                if obj.get("id") != req_id:
+                    continue  # 其他并发 turn 的事件，忽略
                 if t == "progress" and on_progress:
                     try:
                         on_progress(obj.get("text") or "")
@@ -685,7 +819,11 @@ def codex_reply(prompt, session_id=None, on_progress=None):
         except Exception as e:
             msg = str(e)
             log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {msg[:120]}")
-            if "thread not found" in msg:
+            if "HANG" in msg:
+                log("🔧 静默自愈：重启常驻连接后重试")
+                session_id = None  # 卡死的旧线程不再续接，改用新线程
+                _helper_restart()
+            elif "thread not found" in msg:
                 log("🧹 旧线程失效，自动开新线程重试")
                 session_id = None
             else:
@@ -918,6 +1056,19 @@ def register():
             import qrcode
             qrcode.make(data).save(QR_PNG)
             log(f"二维码图片已保存: {QR_PNG}")
+            try:
+                import shutil
+                home = os.environ.get("USERPROFILE", "")
+                desktop = Path(home) / "Desktop"
+                if not desktop.exists():
+                    desktop = Path(home) / "OneDrive" / "Desktop"
+                if desktop.exists():
+                    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+                    dest = desktop / f"微信重绑二维码-{ts}.png"
+                    shutil.copy2(QR_PNG, dest)
+                    log(f"二维码已复制到桌面: {dest}")
+            except Exception as e:
+                log(f"桌面副本失败: {str(e)[:80]}")
         except Exception:
             pass
 
@@ -989,7 +1140,7 @@ class Bridge:
         self.account = json.loads(ACCOUNT_FILE.read_text(encoding="utf-8"))
         self.state = {"sync_buf": "", "context_token": "", "boss_chat": "",
                       "codex_session": None, "session_account": "", "seen": [],
-                      "sessions": []}
+                      "seen_fps": [], "sessions": []}
         if STATE_FILE.exists():
             try:
                 self.state.update(json.loads(STATE_FILE.read_text(encoding="utf-8-sig")))
@@ -997,14 +1148,22 @@ class Bridge:
                 pass
         self.reply_q = deque()
         self._q_evt = threading.Event()
+        self._send_ts = []
+        self._send_lock = threading.Lock()
         for _t in self.state.pop("pending_replies", []) or []:
             if _t:
                 self.reply_q.appendleft(_t)
+        for leftover in (self.state.pop("processing", None) or []):
+            if leftover:
+                log(f"♻️ 上次中断时正在处理的消息补回队列: {leftover[:40]}")
+                self.reply_q.appendleft(leftover)
         self.cb = _CircuitBreaker(self.account.get("account_id", "bridge"))
         self._last_poll_ts = time.time()
         self._retry_queue_flush_ts = 0.0
         self._expiry_pause_until = 0.0
         self._rebind_attempted_at = 0.0
+        self._expiry_streak = 0
+        self._poll_timeout = POLL_TIMEOUT
         self._account_mtime = ACCOUNT_FILE.stat().st_mtime if ACCOUNT_FILE.exists() else 0.0
         self.backend, self.backend_cfg = _load_backend()
         # 当前主账号进池，作为后续备用
@@ -1012,14 +1171,17 @@ class Bridge:
         self._cleanup_stale_session()
 
     def save_state(self):
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        self.state["seen"] = self.state["seen"][-200:]
-        try:
-            self.state["pending_replies"] = list(self.reply_q)
-        except Exception:
-            pass
-        STATE_FILE.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
-        self._persist_account_state(self.account, self.state)
+        with _state_lock:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            self.state["seen"] = self.state["seen"][-200:]
+            try:
+                self.state["pending_replies"] = list(self.reply_q)
+            except Exception:
+                pass
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, STATE_FILE)
+            self._persist_account_state(self.account, self.state)
 
     def _persist_account_state(self, account, state):
         try:
@@ -1071,7 +1233,7 @@ class Bridge:
 
                 resp = _req(f"{self.account['base_url']}/{EP_GET_UPDATES}",
                             {"get_updates_buf": self.state["sync_buf"]},
-                            token=self.account["token"], timeout=45)
+                            token=self.account["token"], timeout=self._poll_timeout)
             except Exception as e:
                 wait = self.cb.on_failure()
                 log(f"⚠️ getupdates 异常(cb={self.cb.state} failures={self.cb.consecutive_failures} "
@@ -1081,6 +1243,9 @@ class Bridge:
 
             ret = resp.get("ret", 0)
             errcode = resp.get("errcode", 0)
+            suggested = resp.get("longpolling_timeout_ms")
+            if isinstance(suggested, int) and 10 <= suggested <= 120:
+                self._poll_timeout = suggested
             if ret not in (0, None) or errcode not in (0, None):
                 if errcode == ERRCODE_SESSION_EXPIRED or _is_stale_session_ret(ret, errcode, resp.get("errmsg")):
                     self._handle_session_expired()
@@ -1097,6 +1262,7 @@ class Bridge:
                 continue
 
             self.cb.on_success()
+            self._expiry_streak = 0
             new_buf = resp.get("get_updates_buf")
             if new_buf:
                 self.state["sync_buf"] = new_buf
@@ -1110,12 +1276,18 @@ class Bridge:
         log("❌ 微信会话过期(-14/失效)，重置熔断；保持单一账号，暂停后自动重试")
         self.cb.on_success()  # 会话过期视为瞬时事件，不累计熔断失败
         self._expiry_pause_until = time.time() + SESSION_EXPIRED_PAUSE
+        self._expiry_streak += 1
+        if self._expiry_streak < EXPIRY_REBIND_THRESHOLD:
+            log(f"会话过期第 {self._expiry_streak}/{EXPIRY_REBIND_THRESHOLD} 轮，静默重试中（先不出码）")
+            return
         if time.time() - self._rebind_attempted_at > REBIND_ATTEMPT_COOLDOWN:
             self._rebind_attempted_at = time.time()
-            bus_notice("@用户 微信专线会话过期；已自动生成新二维码，请尽快扫码（见 qrcode.png）")
+            bus_notice("@用户 微信专线持续过期，已自动生成新二维码，请尽快扫码（见桌面）")
+            _toast("微信通道需要重新扫码",
+                   "会话持续过期，二维码已生成到桌面（微信重绑二维码-时间.png），扫码即可恢复。")
             threading.Thread(target=self._auto_rebind, daemon=True).start()
         else:
-            log(f"自动重绑冷却期内，{int(self._expiry_pause_until - time.time())}s 后重试")
+            log(f"重绑提醒冷却期内（上次 {int(time.time() - self._rebind_attempted_at)}s 前），继续静默重试")
 
     def _activate_account(self, account):
         """重绑热加载：保存旧状态，加载新账号状态，清空旧 AI 会话残留。"""
@@ -1135,6 +1307,10 @@ class Bridge:
         self._account_mtime = ACCOUNT_FILE.stat().st_mtime if ACCOUNT_FILE.exists() else 0.0
         self.save_state()
         log(f"🔄 已加载新绑定账号 {account['account_id']}")
+        try:
+            self.send_weixin("微信通道已重新绑定，恢复使用。")
+        except Exception:
+            pass
 
     def _check_account_reload(self):
         """检测 account.json 被重新注册覆盖 → 热加载新账号（返回是否切换）。"""
@@ -1175,6 +1351,10 @@ class Bridge:
         if not isinstance(msg, dict):
             return
         from_user = msg.get("from_user_id", "")
+        allowed = self.account.get("user_id", "")
+        if not from_user or (allowed and from_user != allowed):
+            log(f"⛔ 拦截未授权发信人: {from_user!r}（仅接受绑定用户 {allowed}）")
+            return
         ctx = msg.get("context_token", "")
         msg_id = msg.get("message_id") or msg.get("client_id") or ""
         if msg_id and msg_id in self.state["seen"]:
@@ -1208,9 +1388,16 @@ class Bridge:
             text += "\n\n[用户这次发来的文件]\n" + "\n".join(f"- {Path(a).name} -> {a}" for a in attachments)
         self.state["boss_chat"] = from_user
         log(f"📩 微信[{from_user[:14]}…]: {text[:60]}")
+        fp = hashlib.md5((from_user + "|" + text).encode("utf-8")).hexdigest()
+        seen_fps = self.state.setdefault("seen_fps", [])
+        if fp in seen_fps:
+            log("♻️ 内容指纹去重，跳过重复消息")
+            return
+        seen_fps.append(fp)
+        self.state["seen_fps"] = seen_fps[-50:]
         norm = _norm_msg(text)
         raw = text.strip()
-        if norm in STOP_PHRASES or (norm.startswith("等") and 2 <= len(norm) <= 6):
+        if norm in STOP_PHRASES:
             stop_current_task()
             self.send_weixin("好，已停下。")
             return
@@ -1265,8 +1452,13 @@ class Bridge:
         self.save_state()
 
     def _get_typing_ticket(self):
-        if self.state.get("typing_ticket"):
-            return self.state["typing_ticket"]
+        entry = self.state.get("typing_ticket")
+        if entry:
+            if isinstance(entry, dict):
+                if time.time() - entry.get("ts", 0) < 600:
+                    return entry.get("ticket", "")
+            else:
+                return entry  # 旧格式字符串兼容
         to = self.state["boss_chat"] or self.account.get("user_id", "")
         try:
             resp = _req(f"{self.account['base_url']}/{EP_GET_CONFIG}",
@@ -1274,7 +1466,7 @@ class Bridge:
                         token=self.account["token"], timeout=10)
             t = str(resp.get("typing_ticket") or "")
             if t:
-                self.state["typing_ticket"] = t
+                self.state["typing_ticket"] = {"ticket": t, "ts": time.time()}
             return t
         except Exception:
             return ""
@@ -1291,49 +1483,75 @@ class Bridge:
         except Exception:
             pass
 
-    # ── 回复工作线程：Agent CLI → 微信（新消息优先） ──
-    def reply_worker(self):
+    # ── 回复工作线程池：Agent CLI → 微信（新消息优先，多消息并发） ──
+    def _reply_worker_loop(self):
         while True:
             self._q_evt.wait()
-            self._q_evt.clear()
             if not self.reply_q:
+                self._q_evt.clear()
                 continue
-            text = self.reply_q.popleft()
             try:
-                level = classify_message(text)
-                sid = self.state.get("codex_session")
-                identity = BACKEND_IDENTITY.get(self.backend, "Codex")
-                prompt = (PRIMER.format(identity=identity) if not sid else "") + SYSTEM_HINT.format(identity=identity) + text
-                on_progress = self.send_weixin
-                if level == "complex":
-                    prompt += TASK_PROTOCOL
-                reply, sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
+                text = self.reply_q.popleft()
+            except IndexError:
+                self._q_evt.clear()
+                continue
+            self._q_evt.clear()
+            self._process_one(text)
+
+    def _process_one(self, text):
+        with _active_turns_lock:
+            parallel = bool(_active_turns)
+            token = uuid.uuid4().hex
+            _active_turns.add(token)
+        self.state.setdefault("processing", []).append(text)
+        self.save_state()
+        try:
+            level = classify_message(text)
+            sid = self.state.get("codex_session")
+            if parallel:
+                sid = None  # 并行模式：新开线程独立处理，不占用主会话
+            identity = BACKEND_IDENTITY.get(self.backend, "Codex")
+            prompt = (PRIMER.format(identity=identity) if not sid else "") + SYSTEM_HINT.format(identity=identity) + text
+            on_progress = self.send_weixin
+            if level == "complex":
+                prompt += TASK_PROTOCOL
+            reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
                                          cfg=self.backend_cfg)
-                self.state["codex_session"] = sid
+            if not parallel and new_sid:
+                self.state["codex_session"] = new_sid
                 self.state["session_account"] = self.account.get("account_id")
-                if reply:
-                    reply, files = _extract_files(reply)
-                    for fp in files:
-                        p = Path(fp).expanduser()
-                        if not p.is_absolute():
-                            p = Path(CODEX_WORK_DIR) / p
-                        try:
-                            if not self.send_file(str(p)):
-                                self.send_weixin(f"文件发送失败：{fp}")
-                        except Exception as e:
-                            log(f"发送文件异常: {str(e)[:120]}")
-                            self.send_weixin(f"文件发送失败：{str(e)[:80]}")
-                    if reply.strip():
-                        self.send_weixin(reply)
-                    self._record_session(sid, text)
-                    self.save_state()
-                elif _cancel_event.is_set():
-                    log("⏹ 任务被 /stop 停止")
-                    _cancel_event.clear()
-                else:
-                    self.send_weixin("（暂时连不上模型服务，稍后再问我一次）")
-            except Exception as e:
-                log(f"⚠️ 回复线程异常: {e}")
+            if reply:
+                reply, files = _extract_files(reply)
+                for fp in files:
+                    p = Path(fp).expanduser()
+                    if not p.is_absolute():
+                        p = Path(CODEX_WORK_DIR) / p
+                    try:
+                        if not self.send_file(str(p)):
+                            self.send_weixin(f"文件发送失败：{fp}")
+                    except Exception as e:
+                        log(f"发送文件异常: {str(e)[:120]}")
+                        self.send_weixin(f"文件发送失败：{str(e)[:80]}")
+                if reply.strip():
+                    self.send_weixin(reply)
+                if not parallel:
+                    self._record_session(new_sid, text)
+                self.save_state()
+            elif _cancel_event.is_set():
+                log("⏹ 任务被 /stop 停止")
+                _cancel_event.clear()
+            else:
+                self.send_weixin("（暂时连不上模型服务，稍后再问我一次）")
+        except Exception as e:
+            log(f"⚠️ 回复线程异常: {e}")
+        finally:
+            with _active_turns_lock:
+                _active_turns.discard(token)
+            try:
+                self.state["processing"].remove(text)
+            except Exception:
+                pass
+            self.save_state()
 
     def _record_session(self, sid, text):
         if not sid:
@@ -1344,6 +1562,7 @@ class Bridge:
         self.state["sessions"] = sessions[-10:]
 
     def _post_message(self, item_list, to, ctx, timeout=20):
+        self._throttle_send()
         msg = {
             "from_user_id": "",
             "to_user_id": to,
@@ -1369,6 +1588,20 @@ class Bridge:
         except Exception as e:
             log(f"微信发送失败: {str(e)[:100]}")
             return "error"
+
+    def _throttle_send(self):
+        """微信发送限流：窗口内最多 SEND_RATE_LIMIT 条，超出则等待（防服务端限流丢消息）。"""
+        with self._send_lock:
+            now = time.time()
+            cutoff = now - SEND_RATE_WINDOW
+            self._send_ts = [t for t in self._send_ts if t > cutoff]
+            if len(self._send_ts) >= SEND_RATE_LIMIT:
+                wait = self._send_ts[0] + SEND_RATE_WINDOW - now
+                if wait > 0:
+                    time.sleep(wait)
+                now = time.time()
+                self._send_ts = [t for t in self._send_ts if t > now - SEND_RATE_WINDOW]
+            self._send_ts.append(now)
 
     def _send_message(self, part, to, ctx, timeout=20):
         return self._post_message([{"type": ITEM_TEXT, "text_item": {"text": part}}], to, ctx, timeout)
@@ -1421,8 +1654,7 @@ class Bridge:
         if not to:
             log("⚠️ 还不知道用户chat_id，回复暂缓")
             return
-        for i in range(0, len(text), 800):
-            part = text[i:i + 800]
+        for part in _split_weixin_text(text):
             r = self._send_message(part, to, ctx)
             if r == "expired":
                 log("去掉 context_token 重试一次")
@@ -1434,11 +1666,22 @@ class Bridge:
             time.sleep(1)
 
     def _flush_retry_queue(self):
-        entries = _drain_retry_queue()
-        if not entries:
+        if not RETRY_QUEUE_FILE.exists():
             return
-        log(f"🔄 排空发送重试队列（{len(entries)} 条）…")
-        for entry in entries:
+        try:
+            lines = [l for l in RETRY_QUEUE_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+        except Exception:
+            return
+        if not lines:
+            return
+        log(f"🔄 排空发送重试队列（{len(lines)} 条）…")
+        remaining = []
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except Exception:
+                remaining.append(line)
+                continue
             part = entry.get("text") or ""
             ctx = entry.get("context_token")
             to = entry.get("to") or self.state["boss_chat"] or self.account.get("user_id", "")
@@ -1449,9 +1692,18 @@ class Bridge:
                 log("补发遇会话过期，去掉 context_token 重试")
                 r = self._send_message(part, to, None, timeout=15)
             if r != "ok":
-                _save_to_retry_queue(to, part, None if r == "expired" else ctx)
+                remaining.append(line)
                 continue
             log(f"📤 补发成功: {part[:40]}")
+        try:
+            if remaining:
+                tmp = RETRY_QUEUE_FILE.with_suffix(".tmp")
+                tmp.write_text("\n".join(remaining) + "\n", encoding="utf-8")
+                os.replace(tmp, RETRY_QUEUE_FILE)
+            else:
+                RETRY_QUEUE_FILE.unlink(missing_ok=True)
+        except Exception as e:
+            log(f"重试队列写回失败: {e}")
 
     # ── 轮询悬挂看门狗：防同步轮询整段卡死 ──
     def watchdog(self):
@@ -1462,6 +1714,18 @@ class Bridge:
             if time.time() - self._last_poll_ts > HANG_TIMEOUT_S:
                 log(f"❌ 轮询看门狗：超过 {HANG_TIMEOUT_S}s 无轮询心跳（疑似悬挂），自杀重启")
                 os._exit(1)
+            # 常驻连接健康：Codex 后端确保 app-server/助手在跑（自动拉起，不重启整桥）
+            if self.backend == "codex":
+                try:
+                    with _helper_lock:
+                        if _helper_proc is None or _helper_proc.poll() is not None:
+                            log("🔄 看门狗：常驻助手不在，重新拉起")
+                            _helper_ensure()
+                        elif not _port_listening(_APP_SERVER_PORT):
+                            log("🔄 看门狗：app-server 不在，重新拉起")
+                            _helper_ensure()
+                except Exception as e:
+                    log(f"看门狗助手检查异常: {str(e)[:80]}")
 
     def _guarded(self, name, fn):
         """线程崩溃写日志（pythonw 无 stderr，崩溃必须落盘）"""
@@ -1477,21 +1741,23 @@ class Bridge:
         log(f"🌉 Codex 微信桥（专线版 v2）启动 (bot={self.account['account_id']})")
         _helper_ensure()  # 预热 Codex 常驻连接（常驻进程）
         t1 = threading.Thread(target=lambda: self._guarded("ilink", self.ilink_loop), daemon=True)
-        t2 = threading.Thread(target=lambda: self._guarded("reply", self.reply_worker), daemon=True)
+        t2a = threading.Thread(target=lambda: self._guarded("reply", self._reply_worker_loop), daemon=True)
+        t2b = threading.Thread(target=lambda: self._guarded("reply", self._reply_worker_loop), daemon=True)
         t3 = threading.Thread(target=lambda: self._guarded("watchdog", self.watchdog), daemon=True)
         t1.start()
-        t2.start()
+        t2a.start()
+        t2b.start()
         t3.start()
         while True:
             time.sleep(60)
-            if not t1.is_alive() or not t2.is_alive():
+            if not t1.is_alive() or not t2a.is_alive() or not t2b.is_alive():
                 log("⚠️ 子线程退出，重启桥进程")
                 os._exit(1)
 
 
 def status():
     if not ACCOUNT_FILE.exists():
-        print("未注册。先执行: python codex_weixin_bridge.py register")
+        print("未注册。先执行: python wechat_bridge.py register")
         return 1
     a = json.loads(ACCOUNT_FILE.read_text(encoding="utf-8"))
     print(f"account_id: {a.get('account_id')}")
@@ -1521,7 +1787,7 @@ def main():
     if cmd == "status":
         return status()
     if not ACCOUNT_FILE.exists():
-        print("未注册。先执行: python codex_weixin_bridge.py register")
+        print("未注册。先执行: python wechat_bridge.py register")
         return 1
     Bridge().run()
     return 0
