@@ -469,7 +469,7 @@ _proc_lock = threading.Lock()
 
 
 def stop_current_task():
-    """/stop：终止正在跑的 codex 子进程。"""
+    """/stop：打断正在跑的任务（常驻连接 interrupt + 兜底杀子进程）。"""
     _cancel_event.set()
     with _proc_lock:
         p = _active_codex_proc
@@ -478,6 +478,10 @@ def stop_current_task():
             p.terminate()
         except Exception:
             pass
+    try:
+        _helper_send({"type": "interrupt"})
+    except Exception:
+        pass
 
 
 def _clean_final(out, sent_markers):
@@ -526,6 +530,86 @@ def _probe_codex_provider(timeout=5):
     return False
 
 
+_APP_SERVER_PORT = 38123
+_APP_SERVER_URL = f"ws://127.0.0.1:{_APP_SERVER_PORT}"
+_HELPER_JS = str(Path(__file__).resolve().parent / "codex_ws_helper.mjs")
+_helper_proc = None
+_helper_in = None
+_helper_out = None
+_helper_lock = threading.Lock()
+
+
+def _port_listening(port, host="127.0.0.1"):
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            return True
+    except Exception:
+        return False
+
+
+def _ensure_app_server():
+    """确保 Codex app-server 常驻服务在跑（常驻进程，不每条消息重启）。"""
+    if _port_listening(_APP_SERVER_PORT):
+        return True
+    log("🔄 启动 Codex app-server 常驻服务…")
+    subprocess.Popen([CODEX_NODE, CODEX_JS, "app-server", "--listen", _APP_SERVER_URL],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    for _ in range(20):
+        time.sleep(1)
+        if _port_listening(_APP_SERVER_PORT):
+            return True
+    return False
+
+
+def _helper_ensure():
+    """确保 WS 连接助手常驻（等待 ready）。"""
+    global _helper_proc, _helper_in, _helper_out
+    if _helper_proc and _helper_proc.poll() is None:
+        return True
+    if not _ensure_app_server():
+        log("⚠️ app-server 启动失败")
+        return False
+    log("🔄 启动 Codex 常驻连接助手…")
+    try:
+        _helper_proc = subprocess.Popen([CODEX_NODE, _HELPER_JS],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                        errors="replace",
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        _helper_in = _helper_proc.stdin
+        _helper_out = _helper_proc.stdout
+    except Exception as e:
+        log(f"助手启动失败: {str(e)[:120]}")
+        return False
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        line = _helper_out.readline()
+        if not line:
+            return False
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+        if obj.get("type") == "ready":
+            log("✅ Codex 常驻连接就绪")
+            return True
+        if obj.get("type") == "error":
+            log(f"助手初始化错误: {obj.get('message')}")
+            return False
+    return False
+
+
+def _helper_send(cmd):
+    with _helper_lock:
+        if not _helper_in:
+            return False
+        _helper_in.write(json.dumps(cmd, ensure_ascii=False) + "\n")
+        _helper_in.flush()
+        return True
+
+
 def _extract_files(reply):
     """从最终回复里取出【文件】标记行，返回 (清理后的文本, 文件路径列表)。"""
     files = [m.strip().strip('"').strip("'") for m in re.findall(r"【文件】\s*([^\r\n]+)", reply or "")]
@@ -534,74 +618,57 @@ def _extract_files(reply):
 
 
 def codex_reply(prompt, session_id=None, on_progress=None):
-    """调本机 Codex CLI 生成回复（微信后台通道）。支持 /stop 取消与按步骤转发进度。"""
-    global _active_codex_proc
+    """通过常驻 app-server 连接生成回复（不每条消息重启 Codex）。"""
     if not _probe_codex_provider():
         log("⚠️ Codex 模型服务不可达（本地代理未启动），跳过本轮")
         return None, session_id
-    base = [CODEX_NODE, CODEX_JS, "exec", "--skip-git-repo-check",
-            "-c", "approval_policy=never"]
-    for attempt in range(3):
+    for attempt in range(2):
         _cancel_event.clear()
+        with _helper_lock:
+            ok = _helper_ensure()
+        if not ok:
+            log("⚠️ Codex 常驻服务不可用")
+            return None, session_id
         try:
-            if session_id:
-                cmd = base + ["resume", session_id, prompt]
-            else:
-                cmd = base + ["-s", "danger-full-access", prompt]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                    stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
-                                    errors="replace",
-                                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                                    cwd=CODEX_WORK_DIR)
-            with _proc_lock:
-                _active_codex_proc = proc
-            found_sid = [session_id]
-            sent_markers = set()
-
-            def _pump():
-                for line in iter(proc.stderr.readline, ""):
-                    m = re.search(r"session id:\s*([0-9a-fA-F-]{8,})", line)
-                    if m:
-                        found_sid[0] = m.group(1)
-                    if on_progress and not _cancel_event.is_set():
-                        mm = re.search(r"【(计划|进度)】\s*(.+)", line.strip())
-                        if mm and line.strip() not in sent_markers \
-                                and "步骤描述" not in line and "自动转发" not in line:
-                            sent_markers.add(line.strip())
-                            try:
-                                on_progress(("📋 " if mm.group(1) == "计划" else "✅ ") + mm.group(2).strip())
-                            except Exception:
-                                pass
-
-            pump_thread = threading.Thread(target=_pump, daemon=True)
-            pump_thread.start()
-            while proc.poll() is None:
+            req_id = uuid.uuid4().hex[:8]
+            payload = {"type": "turn", "id": req_id, "threadId": session_id,
+                       "prompt": prompt, "cwd": CODEX_WORK_DIR}
+            if not _helper_send(payload):
+                raise RuntimeError("助手未连接")
+            deadline = time.time() + REPLY_TIMEOUT
+            while time.time() < deadline:
                 if _cancel_event.is_set():
+                    return None, session_id
+                line = _helper_out.readline()
+                if not line:
+                    raise RuntimeError("助手退出")
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                t = obj.get("type")
+                if t == "progress" and on_progress:
                     try:
-                        proc.kill()
+                        on_progress(obj.get("text") or "")
                     except Exception:
                         pass
-                    proc.wait()
-                    break
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    continue
-            out = (proc.stdout.read() or "").strip()
-            pump_thread.join(timeout=5)
-            with _proc_lock:
-                if _active_codex_proc is proc:
-                    _active_codex_proc = None
-            if _cancel_event.is_set():
-                return None, session_id
-            if proc.returncode == 0:
-                reply = _clean_final(out, sent_markers)
-                if reply:
-                    return reply, found_sid[0] or session_id
-            log(f"⚠️ codex CLI失败(第{attempt+1}次): rc={proc.returncode} out_len={len(out)}")
+                elif t == "result":
+                    text = (obj.get("text") or "").strip()
+                    reply = _clean_final(text, set())
+                    return reply or None, obj.get("threadId") or session_id
+                elif t == "error":
+                    raise RuntimeError(obj.get("message") or "turn error")
+            raise RuntimeError("回复超时")
         except Exception as e:
-            log(f"⚠️ codex CLI异常(第{attempt+1}次): {e}")
-        time.sleep(20 * (attempt + 1))
+            log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {str(e)[:120]}")
+            with _helper_lock:
+                if _helper_proc:
+                    try:
+                        _helper_proc.kill()
+                    except Exception:
+                        pass
+                    _helper_proc = None
+            time.sleep(3)
     return None, session_id
 
 
@@ -1382,6 +1449,7 @@ class Bridge:
         if not _acquire_lock():
             return
         log(f"🌉 Codex 微信桥（专线版 v2）启动 (bot={self.account['account_id']})")
+        _helper_ensure()  # 预热 Codex 常驻连接（常驻进程）
         t1 = threading.Thread(target=lambda: self._guarded("ilink", self.ilink_loop), daemon=True)
         t2 = threading.Thread(target=lambda: self._guarded("reply", self.reply_worker), daemon=True)
         t3 = threading.Thread(target=lambda: self._guarded("watchdog", self.watchdog), daemon=True)
