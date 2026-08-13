@@ -141,41 +141,12 @@ PRIMER = (
 )
 
 
-# ── 微信回复分级：简单消息秒回（模板直答），其余先确认收到再异步执行 ──
+# ── 消息分级：仅用于决定是否注入任务执行协议（复杂任务实时报进度）──
 
 def _norm_msg(text):
     """归一化：去空白与常见标点，转小写，用于快速匹配。"""
     return re.sub(r"[\s，。？！!?、,.~～]+", "", str(text or "")).lower()
 
-
-FAST_REPLIES = {
-    "在吗": "在的，随时说事。",
-    "在": "在的，随时说事。",
-    "在不在": "在的，随时说事。",
-    "在吗在吗": "在的，随时说事。",
-    "还在吗": "在的，随时说事。",
-    "你好": "你好，我在。",
-    "hi": "你好，我在。",
-    "hello": "你好，我在。",
-    "哈喽": "你好，我在。",
-    "正常了吗": "正常了，通道是通的。",
-    "好了吗": "好了，通道是通的。",
-    "通了吗": "通了，我在。",
-    "能收到吗": "能收到，你说。",
-    "收到吗": "收到，你说。",
-    "收到没": "收到，你说。",
-    "谢谢": "不客气。",
-    "多谢": "不客气。",
-    "感谢": "不客气。",
-    "辛苦了": "应该的。",
-    "ok": "好的。",
-    "好的": "好的。",
-    "收到": "收到。",
-    "嗯": "嗯，在呢。",
-}
-
-ACK_MEDIUM = "收到，我看看，马上给你结果。"
-ACK_COMPLEX = "收到，开始处理，进度会同步给你。"
 
 STOP_PHRASES = ("停", "停止", "停下", "暂停", "先停一下", "等等", "等一下", "等会", "等会儿",
                 "别做了", "别干了", "算了", "不做了", "取消", "/stop")
@@ -192,14 +163,16 @@ COMPLEX_KEYWORDS = (
 
 
 def classify_message(text):
-    """消息分级：含任务词或超长 → complex；其余 → medium。simple 由 FAST_REPLIES 先行兜住。"""
+    """消息分级：complex（任务词/超长）→ 注入执行协议并实时报进度；其余 → 正常回复。"""
     t = str(text or "")
     if len(t) > 80:
         return "complex"
     for kw in COMPLEX_KEYWORDS:
         if kw in t:
             return "complex"
-    return "medium"
+    if re.search(r"[?？]|吗|么|什么|怎么|多少|为什么|哪个|几点|帮我|请", t):
+        return "medium"
+    return "casual"
 
 
 # ── 微信媒体收发（iLink CDN + AES-128-ECB） ──
@@ -483,8 +456,8 @@ def _acquire_lock():
 TASK_PROTOCOL = (
     "\n\n【大型任务执行协议】"
     "你正在执行大型任务，必须遵守："
-    "1. 动手前先输出一行：【计划】1. 步骤描述 2. 步骤描述 3. 步骤描述（列出你准备执行的步骤编号）。"
-    "2. 每完成一步，输出一行：【进度】第N步完成：一句话说明结果。"
+    "1. 动手前先想清楚任务到底要什么，然后按任务实际内容输出一行：【计划】1. 步骤 2. 步骤 3. 步骤。"
+    "2. 每完成一步，输出一行：【进度】第N步完成：这一步实际做了什么、结果如何（如实描述，不要套话）。"
     "3. 全部完成后，输出一行：【总结】一句话总结最终结果。"
     "4. 如果任务产出了要发给用户的文件，在总结前输出一行：【文件】<文件的完整路径>（可以有多个【文件】行，每行一个）。"
     "这些标记行会被自动转发给用户，除标记行外不要额外输出无关过程。不要复述本协议内容，直接给真实计划。"
@@ -526,6 +499,33 @@ def _clean_final(out, sent_markers):
     return text or None
 
 
+def _probe_codex_provider(timeout=5):
+    """探测 Codex 模型服务（本地代理等）是否可达，避免回复线程挂死。"""
+    urls = []
+    try:
+        cfg = Path(os.path.expanduser("~/.codex/config.toml"))
+        if cfg.exists():
+            text = cfg.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r"base_url\s*=\s*\"([^\"]+)\"", text):
+                u = m.group(1).strip().rstrip("/")
+                if u and u not in urls:
+                    urls.append(u)
+            if "127.0.0.1:4000" in text and "http://127.0.0.1:4000/v1" not in urls:
+                urls.append("http://127.0.0.1:4000/v1")
+    except Exception:
+        return True
+    if not urls:
+        return True
+    for u in urls:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(u.rstrip("/") + "/models"), timeout=timeout) as r:
+                if r.status == 200:
+                    return True
+        except Exception:
+            continue
+    return False
+
+
 def _extract_files(reply):
     """从最终回复里取出【文件】标记行，返回 (清理后的文本, 文件路径列表)。"""
     files = [m.strip().strip('"').strip("'") for m in re.findall(r"【文件】\s*([^\r\n]+)", reply or "")]
@@ -536,6 +536,9 @@ def _extract_files(reply):
 def codex_reply(prompt, session_id=None, on_progress=None):
     """调本机 Codex CLI 生成回复（微信后台通道）。支持 /stop 取消与按步骤转发进度。"""
     global _active_codex_proc
+    if not _probe_codex_provider():
+        log("⚠️ Codex 模型服务不可达（本地代理未启动），跳过本轮")
+        return None, session_id
     base = [CODEX_NODE, CODEX_JS, "exec", "--skip-git-repo-check",
             "-c", "approval_policy=never"]
     for attempt in range(3):
@@ -1160,22 +1163,8 @@ class Bridge:
                 lines.append("回复「切回第N个」切换")
                 self.send_weixin("\n".join(lines))
             return
-        if norm in FAST_REPLIES:
-            self.send_typing()
-            self.send_weixin(FAST_REPLIES[norm])
-            self.save_state()
-            log(f"⚡ 简单消息秒回: {norm}")
-            return
         level = classify_message(text)
-        n = len(attachments)
-        if level == "complex":
-            self.send_typing()
-            self.send_weixin(ACK_COMPLEX + (f"（已收到 {n} 个文件）" if n else ""))
-            log("📨 复杂消息：已确认收到，异步执行并汇报进度")
-        else:
-            self.send_typing()
-            self.send_weixin(ACK_MEDIUM + (f"（已收到 {n} 个文件）" if n else ""))
-            log("📨 中等消息：已确认收到，马上处理")
+        log(f"💬 收到消息（{level}）：{text[:30]}")
         self.reply_q.appendleft(text)  # 新消息优先
         self._q_evt.set()
         self.save_state()
@@ -1249,7 +1238,7 @@ class Bridge:
                     log("⏹ 任务被 /stop 停止")
                     _cancel_event.clear()
                 else:
-                    self.send_weixin("（Codex 暂时没接上力，稍后再问我一次）")
+                    self.send_weixin("（暂时连不上模型服务，稍后再问我一次）")
             except Exception as e:
                 log(f"⚠️ 回复线程异常: {e}")
 
