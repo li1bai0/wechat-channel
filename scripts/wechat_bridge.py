@@ -84,6 +84,8 @@ CHAT_MODEL = "deepseek-v4-flash"
 CHAT_EFFORT = "medium"
 TASK_MODEL = "deepseek-v4-flash"
 TASK_EFFORT = "medium"
+ALIVE_NUDGE_S = 25                 # 代码级保活：单轮超 N 秒无任何输出，主动发“还在处理中”
+ALIVE_NUDGE_INTERVAL = 60          # 保活提示最小间隔（秒），防刷屏
 BACKEND_FILE = DATA_DIR / "backend.json"
 DEFAULT_BACKEND = "codex"
 BACKEND_IDENTITY = {"codex": "Codex", "claude": "Claude", "generic": "AI 助手"}
@@ -844,15 +846,24 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
             if not _helper_send(payload):
                 raise RuntimeError("助手未连接")
             last_event = time.time()
+            last_alive = time.time()
             while True:
                 if _cancel_event.is_set():
                     return None, session_id
-                if time.time() - last_event > hang_timeout:
+                now = time.time()
+                if now - last_event > hang_timeout:
                     try:
                         _helper_send({"type": "interrupt"})
                     except Exception:
                         pass
                     raise RuntimeError("HANG: 单轮无事件超时")
+                if now - last_alive >= ALIVE_NUDGE_INTERVAL and now - last_event >= ALIVE_NUDGE_S:
+                    try:
+                        if on_progress:
+                            on_progress("⏳ 还在处理中…")
+                    except Exception:
+                        pass
+                    last_alive = now
                 try:
                     obj = _helper_q.get(timeout=5)
                 except queue.Empty:
@@ -931,6 +942,8 @@ def claude_reply(prompt, session_id=None, on_progress=None):
             result = {"sid": session_id, "reply": None}
             sent_markers = set()
             buf = ""
+            last_output = [time.time()]
+            last_alive = [time.time()]
 
             def _handle_text(text):
                 nonlocal buf
@@ -955,6 +968,7 @@ def claude_reply(prompt, session_id=None, on_progress=None):
                     line = line.strip()
                     if not line:
                         continue
+                    last_output[0] = time.time()
                     try:
                         obj = json.loads(line)
                     except Exception:
@@ -984,6 +998,14 @@ def claude_reply(prompt, session_id=None, on_progress=None):
                         pass
                     proc.wait()
                     break
+                now = time.time()
+                if now - last_output[0] >= ALIVE_NUDGE_S and now - last_alive[0] >= ALIVE_NUDGE_INTERVAL:
+                    try:
+                        if on_progress:
+                            on_progress("⏳ 还在处理中…")
+                    except Exception:
+                        pass
+                    last_alive[0] = now
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
@@ -1031,8 +1053,11 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
             out_lines = []
             found_sid = [session_id]
             sent_markers = set()
+            last_output = [time.time()]
+            last_alive = [time.time()]
 
             def _scan(line, is_err):
+                last_output[0] = time.time()
                 m = re.search(sess_re, line)
                 if m:
                     found_sid[0] = m.group(1)
@@ -1067,6 +1092,14 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
                         pass
                     proc.wait()
                     break
+                now = time.time()
+                if now - last_output[0] >= ALIVE_NUDGE_S and now - last_alive[0] >= ALIVE_NUDGE_INTERVAL:
+                    try:
+                        if on_progress:
+                            on_progress("⏳ 还在处理中…")
+                    except Exception:
+                        pass
+                    last_alive[0] = now
                 try:
                     proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:

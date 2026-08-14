@@ -94,11 +94,17 @@ function handle(msg) {
     }
   } else {
     // 工具调用/命令输出/文件变更/推理等事件都算“有活动”：转发心跳，
-    // 让桥在长命令执行期间不会因为“没有文字输出”而误判卡死
+    // 让桥在长命令执行期间不会因为“没有文字输出”而误判卡死；
+    // 同时按 20s 节流把“正在执行操作”作为进度转给微信（代码级保活，不依赖模型自觉）
     const turnId = params.turnId || (params.turn && params.turn.id);
     const st = turns.get(turnId);
     if (st) {
       out({ type: "activity", id: st.reqId });
+      const nowMs = Date.now();
+      if (!st.lastToolTs || nowMs - st.lastToolTs >= 20000) {
+        st.lastToolTs = nowMs;
+        out({ type: "progress", text: "▶️ 正在执行命令/工具…", id: st.reqId });
+      }
     }
   }
 }
@@ -133,7 +139,7 @@ async function startTurn(cmd) {
     const res = await rpc("turn/start", params);
     const turnId = res.turn && res.turn.id;
     if (turnId) {
-      turns.set(turnId, { reqId, threadId, buffer: "", linebuf: "", sent: new Set() });
+      turns.set(turnId, { reqId, threadId, buffer: "", linebuf: "", sent: new Set(), lastToolTs: 0 });
     } else {
       out({ type: "error", message: "turn/start 未返回 turn.id", id: reqId });
     }
