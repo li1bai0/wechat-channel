@@ -30,6 +30,8 @@
 ## 身份与人设
 
 - `PRIMER` / `SYSTEM_HINT` 注入身份（`BACKEND_IDENTITY`：Codex / Claude / AI 助手），微信私聊以配置的身份回答。
+- 基础人设包含三条硬规则（2026-08-14）：① 禁止自改模型/配置/数据库或重启服务，收到这类请求回复由部署方处理；② 干活不许闷头——动手前说明要做什么、关键节点主动报进展、卡住报状态、完成给总结；③ 复杂任务不硬扛，明确转交更强的桌面 Agent。
+- 桥记忆：`work_dir/wechat_memory.md` 每轮注入提示词（`【微信桥记忆】`），对话后追加一行摘要（原子写 + `_state_lock`，`## 最近对话` 段滚动保留 30 条），线程重启不丢上下文。
 
 ## 注册（register）流程细节
 
@@ -41,7 +43,8 @@
 ## 多后端适配层
 
 - 后端由 `weixin_bridge/backend.json` 选择：`codex`（默认）/ `claude` / `generic`；改后重启桥生效。
-- `codex_reply`：**常驻连接**——桥启动 `codex app-server --listen ws://127.0.0.1:38123`（常驻进程），并通过 `scripts/codex_ws_helper.mjs`（node WebSocket 助手）保持长连接；协议为 JSON-RPC：`initialize` → `thread/start`（首条）→ `turn/start`（含 `approvalPolicy: never`、`sandboxPolicy: {type: dangerFullAccess}`）→ 订阅 `item/agentMessage/delta` 流式转发行进标记 → `turn/completed` 取结果；续聊复用同一 `threadId`，不再每条消息重启 Codex；**多消息并发**（读线程+事件队列，按 reqId 路由，空闲续主会话、忙时并行开新线程）。`/stop` 走 `turn/interrupt`。会话过期先静默重试（约 1 小时），持续失效才自动重绑并通过 Windows Toast（右下角非阻塞）提醒。
+- `codex_reply`：**常驻连接**——桥启动 `codex app-server --listen ws://127.0.0.1:38123`（常驻进程），并通过 `scripts/codex_ws_helper.mjs`（node WebSocket 助手）保持长连接；协议为 JSON-RPC：`initialize` → `thread/start`（首条，可带 `baseInstructions` 人设）→ `turn/start`（含 `approvalPolicy: never`、`sandboxPolicy: {type: dangerFullAccess}`，可带 `model`/`effort` 覆盖档位）→ 订阅 `item/agentMessage/delta` 流式转发行进标记 → `turn/completed` 取结果；续聊复用同一 `threadId`，不再每条消息重启 Codex；**多消息并发**（读线程+事件队列，按 reqId 路由，空闲续主会话、忙时并行开新线程）。`/stop` 走 `turn/interrupt`。会话过期先静默重试（约 1 小时），持续失效才自动重绑并通过 Windows Toast（右下角非阻塞）提醒。
+- 长命令不误杀：助手对工具调用/命令输出/文件变更/推理等非文字事件上报 `{"type":"activity","id":N}` 心跳，桥据此刷新单轮超时，只有真正长时间无任何动静才判定卡死。
 - `claude_reply`：`claude.exe -p ... --output-format stream-json --include-partial-messages --verbose --dangerously-skip-permissions`，按行解析 JSON：`stream_event` 的 text_delta 累积文本并扫【计划】/【进度】；`type=result` 取 `result` 与 `session_id`；`--resume <sid>` 续接。
 - `generic_reply`：按 `new_cmd` / `resume_cmd` 模板（`{prompt}`/`{session}`）Popen 任意 CLI，stdout 拼接为回复，`session_regex` 提取会话 id，stdout/stderr 均扫进度标记。
 - `agent_reply` 统一分派；路径由 `_resolve_tool_paths` 从 backend.json / 环境变量 / 常见安装位置解析。
@@ -67,3 +70,4 @@
 - 发送失败落盘重试队列，重启不丢消息
 - 单实例锁，防止双进程轮询被服务端踢
 - 轮询悬挂看门狗，卡死自动自杀并交守护重启
+- 活动心跳防误杀：长命令执行期间有工具事件即不算沉默，对话 90s / 任务 300s 超时只在真无动静时触发

@@ -78,6 +78,12 @@ _DEFAULT_CLAUDE_EXE = ""
 _DEFAULT_WORK_DIR = ""  # 留空则用仓库根目录下的 wechat_work/
 REPLY_TIMEOUT = 600
 TURN_HANG_TIMEOUT = 90    # 常驻连接单轮无任何事件超过此秒数视为卡死，静默自愈重试
+TURN_HANG_TIMEOUT_TASK = 300  # 任务：执行命令时可能长时间无文本事件，放宽到 300s
+# 模型分工（2026-08-14 稳定版）：对话用快速档保证秒回，任务用质量档；可在 backend.json 覆盖
+CHAT_MODEL = "deepseek-v4-flash"
+CHAT_EFFORT = "medium"
+TASK_MODEL = "deepseek-v4-flash"
+TASK_EFFORT = "medium"
 BACKEND_FILE = DATA_DIR / "backend.json"
 DEFAULT_BACKEND = "codex"
 BACKEND_IDENTITY = {"codex": "Codex", "claude": "Claude", "generic": "AI 助手"}
@@ -117,6 +123,8 @@ def _resolve_tool_paths():
 
 CODEX_NODE, CODEX_JS, CLAUDE_EXE, CODEX_WORK_DIR = _resolve_tool_paths()
 INBOX_DIR = Path(CODEX_WORK_DIR) / "inbox"
+MEMORY_FILE = Path(CODEX_WORK_DIR) / "wechat_memory.md"  # 每轮注入 + 对话后写回摘要
+MEMORY_MAX_ENTRIES = 30
 
 # ── 稳定性参数 ──────────────────────────────────────────────────────
 CB_FAILURE_THRESHOLD = 6          # 连续失败次数 → 跳闸 OPEN
@@ -145,6 +153,15 @@ PRIMER = (
     "用户说话直接，不喜欢废话和客套。你是 AI 不是真人：做不到的事（发文件、发邮箱、打电话、"
     "线下操作）一律不许假装能做，直接说实话。你有完整工具权限，用户让干的活直接干，"
     "干完把结果简洁地告诉用户。\n\n"
+    "你的模型、配置和代码由部署方统一维护。不要自行修改桥的配置、模型设置、数据库，"
+    "也不要重启任何服务；收到这类请求（如'切换模型''改配置'）直接回复"
+    "'模型和配置由部署方负责，我请用户转给它处理'，绝对不要动手，不要假装已改。\n\n"
+    "干活不许闷着头：只要是在做事（不是纯聊天），动手前先一句话告诉用户你要做什么；"
+    "过程中每完成一个关键步骤或节点，主动发一句进展（这一步做了什么、结果如何）；"
+    "卡住或需要长时间等待时，主动说明当前状态；全部完成后给一句总结。"
+    "宁可多报不可少报，绝不长时间无声无息。\n\n"
+    "遇到复杂任务（大型开发、系统级改动、长流程工程）不要硬扛："
+    "明确告诉用户'这个任务交给更强的桌面 Agent 更稳'，简要说明已做进度和关键上下文，由部署方转交。\n\n"
 )
 
 
@@ -766,9 +783,44 @@ def _split_weixin_text(text, max_len=MAX_MSG_LEN):
     return [c for c in chunks if c]
 
 
-def codex_reply(prompt, session_id=None, on_progress=None):
+def _load_memory():
+    """读取微信桥记忆文件（每轮注入，不依赖线程）。"""
+    try:
+        if MEMORY_FILE.exists():
+            return MEMORY_FILE.read_text(encoding="utf-8", errors="replace").strip()
+    except Exception as e:
+        log(f"记忆读取失败: {str(e)[:80]}")
+    return ""
+
+
+def _append_memory(entry):
+    """对话后追加一行摘要到记忆文件（原子写 + 锁，超量滚动裁剪）。"""
+    try:
+        with _state_lock:
+            header_lt = "## 长期事实"
+            header_chat = "## 最近对话"
+            text = ""
+            if MEMORY_FILE.exists():
+                text = MEMORY_FILE.read_text(encoding="utf-8", errors="replace")
+            # 拆分：长期事实段保留原样，最近对话段滚动追加
+            if header_chat in text:
+                before, _, after = text.partition(header_chat)
+                lines = [l for l in after.splitlines() if l.strip()][-MEMORY_MAX_ENTRIES:]
+                new_after = "\n" + "\n".join(lines) + ("\n" if lines else "") + entry + "\n"
+                text = before + header_chat + new_after
+            else:
+                text = (text.rstrip() + "\n\n" if text.strip() else "") + header_chat + "\n" + entry + "\n"
+            tmp = MEMORY_FILE.with_suffix(".tmp")
+            tmp.write_text(text, encoding="utf-8")
+            os.replace(tmp, MEMORY_FILE)
+    except Exception as e:
+        log(f"记忆写入失败: {str(e)[:80]}")
+
+
+def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=None, base=None, timeout=None):
     """通过常驻 app-server 连接生成回复（不每条消息重启 Codex）。"""
     global _helper_proc
+    hang_timeout = timeout or TURN_HANG_TIMEOUT
     if not _probe_codex_provider():
         log("⚠️ Codex 模型服务不可达（本地代理未启动），跳过本轮")
         return None, session_id
@@ -783,13 +835,19 @@ def codex_reply(prompt, session_id=None, on_progress=None):
             req_id = uuid.uuid4().hex[:8]
             payload = {"type": "turn", "id": req_id, "threadId": session_id,
                        "prompt": prompt, "cwd": CODEX_WORK_DIR}
+            if model:
+                payload["model"] = model
+            if effort:
+                payload["effort"] = effort
+            if base:
+                payload["base"] = base
             if not _helper_send(payload):
                 raise RuntimeError("助手未连接")
             last_event = time.time()
             while True:
                 if _cancel_event.is_set():
                     return None, session_id
-                if time.time() - last_event > TURN_HANG_TIMEOUT:
+                if time.time() - last_event > hang_timeout:
                     try:
                         _helper_send({"type": "interrupt"})
                     except Exception:
@@ -1030,13 +1088,15 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
     return None, session_id
 
 
-def agent_reply(backend, prompt, session_id=None, on_progress=None, cfg=None):
+def agent_reply(backend, prompt, session_id=None, on_progress=None, cfg=None,
+                model=None, effort=None, base=None, timeout=None):
     """按后端分派回复生成。"""
     if backend == "claude":
         return claude_reply(prompt, session_id, on_progress)
     if backend == "generic":
         return generic_reply(prompt, session_id, on_progress, (cfg or {}).get("generic") or {})
-    return codex_reply(prompt, session_id, on_progress)
+    return codex_reply(prompt, session_id, on_progress, model=model, effort=effort,
+                       base=base, timeout=timeout)
 
 
 # ───────────────────────── 注册（QR 扫码） ─────────────────────────
@@ -1511,12 +1571,23 @@ class Bridge:
             if parallel:
                 sid = None  # 并行模式：新开线程独立处理，不占用主会话
             identity = BACKEND_IDENTITY.get(self.backend, "Codex")
-            prompt = (PRIMER.format(identity=identity) if not sid else "") + SYSTEM_HINT.format(identity=identity) + text
+            mem = _load_memory()
+            memory_block = ("【微信桥记忆】\n" + mem + "\n\n") if mem else ""
+            prompt = memory_block + SYSTEM_HINT.format(identity=identity) + text
+            base_prompt = PRIMER.format(identity=identity) if not sid else ""
             on_progress = self.send_weixin
             if level == "complex":
                 prompt += TASK_PROTOCOL
+            cfg = self.backend_cfg or {}
+            turn_model, turn_effort = ((cfg.get("task_model") or TASK_MODEL,
+                                        cfg.get("task_effort") or TASK_EFFORT)
+                                       if level == "complex" else
+                                       (cfg.get("chat_model") or CHAT_MODEL,
+                                        cfg.get("chat_effort") or CHAT_EFFORT))
+            turn_timeout = TURN_HANG_TIMEOUT_TASK if level == "complex" else TURN_HANG_TIMEOUT
             reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
-                                         cfg=self.backend_cfg)
+                                         cfg=self.backend_cfg, model=turn_model, effort=turn_effort,
+                                         base=base_prompt or None, timeout=turn_timeout)
             if not parallel and new_sid:
                 self.state["codex_session"] = new_sid
                 self.state["session_account"] = self.account.get("account_id")
@@ -1536,6 +1607,7 @@ class Bridge:
                     self.send_weixin(reply)
                 if not parallel:
                     self._record_session(new_sid, text)
+                    _append_memory(f"- {datetime.now():%Y-%m-%d %H:%M} | 用户：{text[:60]} → 桥：{reply[:80]}")
                 self.save_state()
             elif _cancel_event.is_set():
                 log("⏹ 任务被 /stop 停止")

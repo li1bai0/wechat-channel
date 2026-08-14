@@ -4,6 +4,10 @@
   "codex_js": "C:\\Users\\<you>\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
   "claude_exe": "C:\\Users\\<you>\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
   "work_dir": "C:\\Users\\<you>\\wechat_work",
+  "chat_model": "deepseek-v4-flash",
+  "chat_effort": "medium",
+  "task_model": "deepseek-v4-flash",
+  "task_effort": "medium",
   "generic": {
     "new_cmd": ["myagent", "-p", "{prompt}"],
     "resume_cmd": ["myagent", "-p", "{prompt}", "-s", "{session}"],

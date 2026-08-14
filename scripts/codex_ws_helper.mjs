@@ -8,6 +8,7 @@
  *   {"type":"ready"}
  *   {"type":"progress","text":"...","id":N}   # 【计划】/【进度】标记行
  *   {"type":"delta","text":"...","id":N}       # 流式文本片段
+ *   {"type":"activity","id":N}                # 工具执行/命令输出等非文字活动（防误判卡死）
  *   {"type":"result","text":"...","threadId":"...","id":N}
  *   {"type":"error","message":"...","id":N}
  */
@@ -91,6 +92,14 @@ function handle(msg) {
       out({ type: "error", message: String((params && (params.message || params.error)) || method), id: st.reqId });
       turns.delete(turnId);
     }
+  } else {
+    // 工具调用/命令输出/文件变更/推理等事件都算“有活动”：转发心跳，
+    // 让桥在长命令执行期间不会因为“没有文字输出”而误判卡死
+    const turnId = params.turnId || (params.turn && params.turn.id);
+    const st = turns.get(turnId);
+    if (st) {
+      out({ type: "activity", id: st.reqId });
+    }
   }
 }
 
@@ -103,8 +112,15 @@ async function startTurn(cmd) {
         cwd: cmd.cwd || process.cwd(),
         approvalPolicy: "never",
         sandbox: "danger-full-access",
+        ...(cmd.base ? { baseInstructions: cmd.base } : {}),
       });
       threadId = started.thread.id || started.thread || started.id;
+    } else {
+      try {
+        await rpc("thread/resume", { threadId });
+      } catch (e) {
+        // 线程不存在/失效：交给 turn/start 报 thread not found，由桥端开新线程并告知用户
+      }
     }
     const params = {
       threadId,
@@ -113,6 +129,7 @@ async function startTurn(cmd) {
       sandboxPolicy: { type: "dangerFullAccess" },
     };
     if (cmd.effort) params.effort = cmd.effort;
+    if (cmd.model) params.model = cmd.model;
     const res = await rpc("turn/start", params);
     const turnId = res.turn && res.turn.id;
     if (turnId) {
