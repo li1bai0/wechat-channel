@@ -105,6 +105,8 @@ Windows 建议用 `pythonw` 后台运行，并配合任务计划/守护脚本保
 
 模型与推理档位也可配置：`chat_model` / `chat_effort`（对话，默认 `deepseek-v4-flash` + `medium`，快速响应）、`task_model` / `task_effort`（任务，默认同档）。仅 Codex 后端生效。
 
+> **Windows 注意（开箱即用）**：`claude_exe` 留空即可自动探测——按顺序找 `PATH 里的 claude`、npm 全局 `claude.cmd`/`claude`、原生安装的 `~/.local/bin/claude.exe`、npm 包内 `claude.js`（自动用 node 启动）。不要手填 `node_modules\@anthropic-ai\claude-code\bin\claude.exe`（Windows 上不存在）；`.cmd` 壳已由桥直接处理，无需额外配置。
+
 ## 微信命令
 
 中文习惯，斜杠命令仍兼容：

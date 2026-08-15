@@ -112,9 +112,21 @@ def _resolve_tool_paths():
                 break
     if not claude_exe or not os.path.exists(claude_exe):
         apd = os.environ.get("APPDATA", "")
-        for cand in (_DEFAULT_CLAUDE_EXE,
-                     os.path.join(apd, "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.exe")):
-            if os.path.exists(cand):
+        home = os.path.expanduser("~")
+        cands = []
+        w = shutil.which("claude")
+        if w:
+            cands.append(w)
+        cands += [
+            _DEFAULT_CLAUDE_EXE,
+            os.path.join(apd, "npm", "claude.cmd"),          # Windows: npm 全局 .cmd 壳
+            os.path.join(apd, "npm", "claude"),
+            os.path.join(home, ".local", "bin", "claude.exe"),  # 原生安装（Windows/macOS）
+            os.path.join(home, ".local", "bin", "claude"),
+            os.path.join(apd, "npm", "node_modules", "@anthropic-ai", "claude-code", "bin", "claude.js"),
+        ]
+        for cand in cands:
+            if cand and os.path.exists(cand):
                 claude_exe = cand
                 break
     if not work_dir:
@@ -954,7 +966,14 @@ def _load_backend():
 def claude_reply(prompt, session_id=None, on_progress=None):
     """调本机 Claude Code CLI（stream-json）生成回复。支持续接、进度转发与 /stop。"""
     global _active_codex_proc
-    base = [CLAUDE_EXE, "-p", prompt, "--output-format", "stream-json",
+    exe = CLAUDE_EXE
+    if not exe or not os.path.exists(exe):
+        log("⚠️ claude 可执行文件未找到：请安装 Claude Code（npm i -g @anthropic-ai/claude-code）或配置 backend.json 的 claude_exe")
+        return None, session_id
+    cmd_head = [exe]
+    if exe.lower().endswith(".js"):
+        cmd_head = [CODEX_NODE, exe]  # npm 包 bin 是 js 入口，需要 node 启动
+    base = cmd_head + ["-p", prompt, "--output-format", "stream-json",
             "--include-partial-messages", "--verbose", "--dangerously-skip-permissions"]
     if session_id:
         base += ["--resume", session_id]
@@ -1069,6 +1088,10 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
     else:
         log("generic 后端未配置 new_cmd/resume_cmd，无法调用")
         return None, session_id
+    if cmd:
+        cmd[0] = shutil.which(cmd[0]) or cmd[0]   # Windows: 裸命令自动解析（.cmd/.exe）
+        if cmd[0].lower().endswith(".js"):
+            cmd.insert(0, CODEX_NODE)
     for attempt in range(3):
         _cancel_event.clear()
         try:

@@ -2,7 +2,7 @@
   "backend": "codex",
   "node_exe": "C:\\Program Files\\nodejs\\node.exe",
   "codex_js": "C:\\Users\\<you>\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\bin\\codex.js",
-  "claude_exe": "C:\\Users\\<you>\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\bin\\claude.exe",
+  "claude_exe": "",
   "work_dir": "C:\\Users\\<you>\\wechat_work",
   "chat_model": "deepseek-v4-flash",
   "chat_effort": "medium",
