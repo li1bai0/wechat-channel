@@ -47,7 +47,7 @@
 - 后端由 `weixin_bridge/backend.json` 选择：`codex`（默认）/ `claude` / `generic`；改后重启桥生效。
 - `codex_reply`：**常驻连接**——桥启动 `codex app-server --listen ws://127.0.0.1:38123`（常驻进程），并通过 `scripts/codex_ws_helper.mjs`（node WebSocket 助手）保持长连接；协议为 JSON-RPC：`initialize` → `thread/start`（首条，可带 `baseInstructions` 人设）→ `turn/start`（含 `approvalPolicy: never`、`sandboxPolicy: {type: dangerFullAccess}`，可带 `model`/`effort` 覆盖档位）→ 订阅 `item/agentMessage/delta` 流式转发行进标记 → `turn/completed` 取结果；续聊复用同一 `threadId`，不再每条消息重启 Codex；**多消息并发**（读线程+事件队列，空闲续主会话、忙时并行开新线程）。`/stop` 走 `turn/interrupt`。会话过期先静默重试（约 1 小时），持续失效才自动重绑并通过 Windows Toast（右下角非阻塞）提醒。
 - 事件按 turn 路由（2026-08-15）：`_turn_queues[req_id]` 每个 turn 一个独立队列，读线程按 `id` 派发（`ready`/`exit` 走共享队列），`codex_reply` try/finally 注册/注销；修复了多 worker 抢共享队列导致“结果被别的 turn 吞掉、3 分钟送不到”的饿死问题。
-- 长命令不误杀（纯代码）：助手对工具调用/命令输出/文件变更/推理等非文字事件上报 `{"type":"activity","id":N}` 心跳，桥据此刷新单轮超时，只有真正长时间无任何动静才判定卡死；同时助手按 20s 节流把「▶️ 正在执行命令/工具…」作为进度转发到微信（代码级保活，不依赖模型输出）。
+- 长命令不误杀（纯代码）：助手对工具调用/命令输出/文件变更/推理等非文字事件上报 `{"type":"activity","id":N}` 心跳，桥据此刷新单轮超时，只有真正长时间无任何动静才判定卡死；另有单轮 25s 无输出自动发「⏳ 还在处理中…」（60s 节流）作为代码级保活提示（不依赖模型输出）。
 - `claude_reply`：`claude.exe -p ... --output-format stream-json --include-partial-messages --verbose --dangerously-skip-permissions`，按行解析 JSON：`stream_event` 的 text_delta 累积文本并扫【计划】/【进度】；`type=result` 取 `result` 与 `session_id`；`--resume <sid>` 续接。
 - `generic_reply`：按 `new_cmd` / `resume_cmd` 模板（`{prompt}`/`{session}`）Popen 任意 CLI，stdout 拼接为回复，`session_regex` 提取会话 id，stdout/stderr 均扫进度标记。
 - `agent_reply` 统一分派；路径由 `_resolve_tool_paths` 从 backend.json / 环境变量 / 常见安装位置解析。

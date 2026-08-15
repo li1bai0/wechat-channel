@@ -142,7 +142,7 @@ def _resolve_tool_paths():
                 claude_exe = cand
                 break
     if not work_dir:
-        work_dir = _DEFAULT_WORK_DIR
+        work_dir = str(HERE.parent / "wechat_work")  # 仓库根下 wechat_work（兑现注释承诺）
     Path(work_dir).mkdir(parents=True, exist_ok=True)
     return node_exe, codex_js, claude_exe, work_dir
 
@@ -955,9 +955,16 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
             msg = str(e)
             log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {msg[:120]}")
             if "HANG" in msg:
-                log("🔧 静默自愈：重启常驻连接后重试")
-                session_id = None  # 卡死的旧线程不再续接，改用新线程
-                _helper_restart()
+                if attempt >= 2:
+                    log("🧹 多次卡死：放弃旧线程并重启常驻连接（自愈）")
+                    session_id = None  # 卡死的旧线程不再续接，改用新线程
+                    try:
+                        _helper_restart()
+                    except Exception as ex:
+                        log(f"重启常驻连接异常: {str(ex)[:80]}")
+                else:
+                    log("🔧 单轮无事件超时：中断重试（保留线程上下文）")
+                time.sleep(3)
             elif "thread not found" in msg:
                 log("🧹 旧线程失效，自动开新线程重试")
                 session_id = None
@@ -1309,6 +1316,8 @@ class Bridge:
         self.accounts_dir = ACCOUNTS_DIR
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
         self.account = json.loads(ACCOUNT_FILE.read_text(encoding="utf-8"))
+        if not (self.account.get("user_id") or ""):
+            log("⚠️ 账号缺少 user_id：已进入拒收模式（fail-closed），请重新扫码注册")
         self.state = {"sync_buf": "", "context_token": "", "boss_chat": "",
                       "codex_session": None, "session_account": "", "seen": [],
                       "seen_fps": [], "sessions": []}
@@ -1535,8 +1544,8 @@ class Bridge:
         if not isinstance(msg, dict):
             return
         from_user = msg.get("from_user_id", "")
-        allowed = self.account.get("user_id", "")
-        if not from_user or (allowed and from_user != allowed):
+        allowed = self.account.get("user_id", "") or ""
+        if not from_user or from_user != allowed:
             log(f"⛔ 拦截未授权发信人: {from_user!r}（仅接受绑定用户 {allowed}）")
             return
         ctx = msg.get("context_token", "")
@@ -1861,7 +1870,9 @@ class Bridge:
             self.save_state()
 
     def _preempt_task(self):
-        """新消息优先：打断当前后台任务（按 reqId 定向中断，任务自动恢复）。"""
+        """新消息优先：打断当前后台任务（按 reqId 定向中断，任务自动恢复）。仅 codex 后端支持。"""
+        if self.backend != "codex":
+            return  # claude/generic 无法定向打断：任务继续后台跑，聊天并行处理
         with self._task_cond:
             if not self._running_task.get("active"):
                 return
@@ -1913,17 +1924,21 @@ class Bridge:
 
     def _throttle_send(self):
         """微信发送限流：窗口内最多 SEND_RATE_LIMIT 条，超出则等待（防服务端限流丢消息）。"""
+        wait = 0.0
         with self._send_lock:
             now = time.time()
             cutoff = now - SEND_RATE_WINDOW
             self._send_ts = [t for t in self._send_ts if t > cutoff]
             if len(self._send_ts) >= SEND_RATE_LIMIT:
                 wait = self._send_ts[0] + SEND_RATE_WINDOW - now
-                if wait > 0:
-                    time.sleep(wait)
+            if wait <= 0:
+                self._send_ts.append(now)
+        if wait > 0:
+            time.sleep(wait)  # 锁外等待：不阻塞其他发送线程
+            with self._send_lock:
                 now = time.time()
                 self._send_ts = [t for t in self._send_ts if t > now - SEND_RATE_WINDOW]
-            self._send_ts.append(now)
+                self._send_ts.append(now)
 
     def _send_message(self, part, to, ctx, timeout=20):
         return self._post_message([{"type": ITEM_TEXT, "text_item": {"text": part}}], to, ctx, timeout)
