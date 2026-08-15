@@ -64,9 +64,13 @@
 
 ### 环境要求
 
-- Windows（macOS/Linux 需自行适配路径与守护方式）
+- Windows / macOS / Linux 均可运行（守护方式：Windows 用计划任务/守护脚本，macOS/Linux 用 launchd/systemd 自配）
 - Python 3.10+，`pip install pycryptodome`
-- 至少一个 Agent：Codex CLI 或 Claude Code（npm 安装）
+- Node.js 18+（Codex 后端需要它跑常驻 WS 助手）
+- 至少一个 Agent，且**首次使用先在本机登录**：
+  - Codex：`codex login`（或已有 `~/.codex/auth.json`）；自动探测原生 CLI 二进制（`~/.codex/bin/codex` / PATH）或 npm 安装（`@openai/codex`）
+  - Claude Code：`claude login`，或设置环境变量 `ANTHROPIC_API_KEY`
+  - 任意 CLI（generic）：装好即可，命令模板写在 `backend.json`
 
 ### 1. 准备
 

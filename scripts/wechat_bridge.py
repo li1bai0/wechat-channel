@@ -105,9 +105,21 @@ def _resolve_tool_paths():
     node_exe = cfg.get("node_exe") or os.environ.get("CODEX_NODE") or shutil.which("node") or _DEFAULT_NODE
     if not codex_js or not os.path.exists(codex_js):
         apd = os.environ.get("APPDATA", "")
-        for cand in (_DEFAULT_CODEX_JS,
-                     os.path.join(apd, "npm", "node_modules", "@openai", "codex", "bin", "codex.js")):
-            if os.path.exists(cand):
+        home = os.path.expanduser("~")
+        cands = []
+        w = shutil.which("codex")
+        if w:
+            cands.append(w)
+        cands += [
+            _DEFAULT_CODEX_JS,
+            os.path.join(home, ".codex", "bin", "codex"),        # 原生 CLI（macOS/Linux）
+            os.path.join(home, ".codex", "bin", "codex.exe"),    # 原生 CLI（Windows）
+            os.path.join(home, ".local", "bin", "codex"),
+            os.path.join(apd, "npm", "node_modules", "@openai", "codex", "bin", "codex.js"),
+            os.path.join(home, "node_modules", "@openai", "codex", "bin", "codex.js"),
+        ]
+        for cand in cands:
+            if cand and os.path.exists(cand):
                 codex_js = cand
                 break
     if not claude_exe or not os.path.exists(claude_exe):
@@ -136,6 +148,7 @@ def _resolve_tool_paths():
 
 
 CODEX_NODE, CODEX_JS, CLAUDE_EXE, CODEX_WORK_DIR = _resolve_tool_paths()
+CODEX_NATIVE = bool(CODEX_JS) and not CODEX_JS.lower().endswith(".js")  # 原生 codex 二进制 vs npm codex.js
 INBOX_DIR = Path(CODEX_WORK_DIR) / "inbox"
 MEMORY_FILE = Path(CODEX_WORK_DIR) / "wechat_memory.md"  # 每轮注入 + 对话后写回摘要
 MEMORY_MAX_ENTRIES = 30
@@ -356,6 +369,8 @@ def bus_notice(content):
 
 def _toast(title, text):
     """右下角 Windows Toast 通知（不阻塞、不影响任务）。"""
+    if os.name != "nt":
+        return  # 非 Windows 无 Toast，静默跳过
     try:
         subprocess.Popen(["powershell.exe", "-NoProfile", "-WindowStyle", "Hidden",
                           "-ExecutionPolicy", "Bypass", "-File",
@@ -474,6 +489,12 @@ def _drain_retry_queue():
 
 def _pid_alive(pid):
     """判断 pid 是否仍为运行中的桥进程（防 PID 复用误判）。"""
+    if os.name != "nt":
+        try:
+            os.kill(int(pid), 0)
+            return True
+        except (OSError, ProcessLookupError):
+            return False
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     STILL_ACTIVE = 259
     try:
@@ -624,8 +645,12 @@ def _ensure_app_server():
     if _port_listening(_APP_SERVER_PORT):
         return True
     log("🔄 启动 Codex app-server 常驻服务…")
+    if CODEX_NATIVE:
+        cmd = [CODEX_JS, "app-server", "--listen", _APP_SERVER_URL]
+    else:
+        cmd = [CODEX_NODE, CODEX_JS, "app-server", "--listen", _APP_SERVER_URL]
     _app_server_proc = subprocess.Popen(
-        [CODEX_NODE, CODEX_JS, "app-server", "--listen", _APP_SERVER_URL],
+        cmd,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     for _ in range(20):
