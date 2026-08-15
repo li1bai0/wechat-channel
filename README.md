@@ -75,8 +75,8 @@
 ### 1. 准备
 
 ```bash
-git clone https://github.com/li1bai0/wxagent.git
-cd wxagent
+git clone https://github.com/li1bai0/weixin.git
+cd weixin
 pip install pycryptodome
 ```
 
