@@ -564,6 +564,10 @@ def stop_current_task():
         _helper_send({"type": "interrupt"})
     except Exception:
         pass
+    try:
+        _claude_helper_send({"type": "interrupt"})
+    except Exception:
+        pass
 
 
 def _clean_final(out, sent_markers):
@@ -615,6 +619,7 @@ def _probe_codex_provider(timeout=5):
 _APP_SERVER_PORT = 38123
 _APP_SERVER_URL = f"ws://127.0.0.1:{_APP_SERVER_PORT}"
 _HELPER_JS = str(Path(__file__).resolve().parent / "codex_ws_helper.mjs")
+_CLAUDE_HELPER_PY = str(Path(__file__).resolve().parent / "claude_helper.py")
 _TOAST_PS1 = str(Path(__file__).resolve().parent / "show_toast.ps1")
 _app_server_proc = None
 _helper_proc = None
@@ -625,6 +630,14 @@ _helper_reader = None
 _helper_lock = threading.Lock()
 _turn_queues = {}                 # req_id -> queue.Queue：事件按 turn 路由，防并发互抢饿死
 _turn_queues_lock = threading.Lock()
+_claude_proc = None
+_claude_in = None
+_claude_out = None
+_claude_q = queue.Queue()
+_claude_reader = None
+_claude_lock = threading.Lock()
+_claude_turn_queues = {}          # claude 常驻：req_id -> queue.Queue
+_claude_turn_queues_lock = threading.Lock()
 _state_lock = threading.Lock()
 _active_turns = set()
 _active_turns_lock = threading.Lock()
@@ -768,6 +781,137 @@ def _helper_send(cmd):
             return False
         _helper_in.write(json.dumps(cmd, ensure_ascii=False) + "\n")
         _helper_in.flush()
+        return True
+
+
+# ───────────────────────── Claude Code 常驻连接（对等 codex_ws_helper） ─────────────────────────
+
+def _claude_helper_start_reader():
+    """常驻读线程：把 claude 助手 stdout 事件推入队列（按 req_id 路由）。"""
+    global _claude_reader
+
+    def _read():
+        for line in iter(_claude_out.readline, ""):
+            try:
+                obj = json.loads(line)
+            except Exception:
+                continue
+            rid = obj.get("id")
+            if rid:
+                with _claude_turn_queues_lock:
+                    q = _claude_turn_queues.get(rid)
+                if q is not None:
+                    q.put(obj)
+                    continue
+            _claude_q.put(obj)  # ready/无 id 事件：进共享队列
+        _claude_q.put({"type": "exit"})
+        with _claude_turn_queues_lock:
+            qs = list(_claude_turn_queues.values())
+        for q in qs:
+            q.put({"type": "exit"})
+
+    _claude_reader = threading.Thread(target=_read, daemon=True)
+    _claude_reader.start()
+
+
+def _kill_stray_claude_helpers():
+    """清理残留的 claude_helper 进程（防孤儿堆积）。只清本助手，不动用户 claude.exe。"""
+    if os.name != "nt":
+        try:
+            subprocess.run(["pkill", "-f", "claude_helper.py"], capture_output=True, timeout=10)
+        except Exception:
+            pass
+        return
+    try:
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process | Where-Object { $_.Name -match 'python' -and "
+             "$_.CommandLine -match 'claude_helper.py' } | "
+             "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"],
+            capture_output=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except Exception:
+        pass
+
+
+def _claude_helper_ensure():
+    """确保 Claude 常驻子进程就绪（等待 ready）。"""
+    global _claude_proc, _claude_in, _claude_out, _claude_q
+    if _claude_proc and _claude_proc.poll() is None:
+        return True
+    if not CLAUDE_EXE or not os.path.exists(CLAUDE_EXE):
+        log("⚠️ claude 可执行文件未找到，跳过常驻助手")
+        return False
+    log("🔄 启动 Claude 常驻连接助手…")
+    try:
+        _kill_stray_claude_helpers()
+        env = dict(os.environ)
+        env["CLAUDE_WORK_DIR"] = str(CODEX_WORK_DIR)
+        env["CLAUDE_CLI"] = CLAUDE_EXE
+        _claude_proc = subprocess.Popen([sys.executable, "-u", _CLAUDE_HELPER_PY],
+                                        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, text=True, encoding="utf-8",
+                                        errors="replace", env=env,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        _claude_in = _claude_proc.stdin
+        _claude_out = _claude_proc.stdout
+        _claude_q = queue.Queue()
+        with _claude_turn_queues_lock:
+            _claude_turn_queues.clear()
+    except Exception as e:
+        log(f"Claude 助手启动失败: {str(e)[:120]}")
+        return False
+    _claude_helper_start_reader()
+    deadline = time.time() + 90
+    while time.time() < deadline:
+        try:
+            obj = _claude_q.get(timeout=5)
+        except queue.Empty:
+            continue
+        t = obj.get("type")
+        if t == "ready":
+            log("✅ Claude 常驻连接就绪")
+            return True
+        if t == "exit":
+            log("⚠️ Claude 助手进程退出")
+            return False
+        if t == "error":
+            log(f"Claude 助手初始化错误: {obj.get('message')}")
+            return False
+    log("⚠️ Claude 助手 ready 超时，已终止")
+    try:
+        _claude_proc.kill()
+    except Exception:
+        pass
+    return False
+
+
+def _claude_helper_restart():
+    """卡死自愈：杀掉 claude 助手，整体重拉（静默）。"""
+    global _claude_proc, _claude_in, _claude_out, _claude_q, _claude_reader
+    with _claude_lock:
+        if _claude_proc:
+            try:
+                _claude_proc.kill()
+            except Exception:
+                pass
+            _claude_proc = None
+            _claude_in = None
+            _claude_out = None
+            _claude_q = queue.Queue()
+            with _claude_turn_queues_lock:
+                _claude_turn_queues.clear()
+            _claude_reader = None
+    time.sleep(3)
+    return _claude_helper_ensure()
+
+
+def _claude_helper_send(cmd):
+    with _claude_lock:
+        if not _claude_in:
+            return False
+        _claude_in.write(json.dumps(cmd, ensure_ascii=False) + "\n")
+        _claude_in.flush()
         return True
 
 
@@ -995,8 +1139,110 @@ def _load_backend():
     return DEFAULT_BACKEND, {}
 
 
-def claude_reply(prompt, session_id=None, on_progress=None):
-    """调本机 Claude Code CLI（stream-json）生成回复。支持续接、进度转发与 /stop。"""
+def _claude_reply_persistent(prompt, session_id=None, on_progress=None, base=None, timeout=None):
+    """通过常驻 claude 子进程生成回复（不每条消息冷启动）。"""
+    global _claude_proc
+    hang_timeout = timeout or TURN_HANG_TIMEOUT
+    _cancel_event.clear()
+    for attempt in range(3):
+        if _cancel_event.is_set():
+            return None, session_id
+        with _claude_lock:
+            ok = _claude_helper_ensure()
+        if not ok:
+            log("⚠️ Claude 常驻服务不可用")
+            return None, session_id
+        try:
+            req_id = uuid.uuid4().hex[:8]
+            my_q = queue.Queue()
+            with _claude_turn_queues_lock:
+                _claude_turn_queues[req_id] = my_q
+            try:
+                payload = {"type": "turn", "id": req_id, "session": session_id,
+                           "prompt": prompt}
+                if base:
+                    payload["base"] = base
+                if not _claude_helper_send(payload):
+                    raise RuntimeError("助手未连接")
+                last_event = time.time()
+                last_alive = time.time()
+                while True:
+                    if _cancel_event.is_set():
+                        return None, session_id
+                    now = time.time()
+                    if now - last_event > hang_timeout:
+                        try:
+                            _claude_helper_send({"type": "interrupt", "reqId": req_id})
+                        except Exception:
+                            pass
+                        raise RuntimeError("HANG: 单轮无事件超时")
+                    if now - last_alive >= ALIVE_NUDGE_INTERVAL and now - last_event >= ALIVE_NUDGE_S:
+                        try:
+                            if on_progress:
+                                on_progress("⏳ 还在处理中…")
+                        except Exception:
+                            pass
+                        last_alive = now
+                    try:
+                        obj = my_q.get(timeout=5)
+                    except queue.Empty:
+                        continue
+                    last_event = time.time()
+                    t = obj.get("type")
+                    if t == "exit":
+                        raise RuntimeError("助手退出")
+                    if t == "progress" and on_progress:
+                        try:
+                            on_progress(obj.get("text") or "")
+                        except Exception:
+                            pass
+                    elif t == "result":
+                        text = (obj.get("text") or "").strip()
+                        reply = _clean_final(text, set())
+                        return reply or None, obj.get("session") or session_id
+                    elif t == "error":
+                        raise RuntimeError(obj.get("message") or "turn error")
+            finally:
+                with _claude_turn_queues_lock:
+                    _claude_turn_queues.pop(req_id, None)
+        except Exception as e:
+            msg = str(e)
+            log(f"⚠️ Claude 常驻连接异常(第{attempt+1}次): {msg[:120]}")
+            if "HANG" in msg:
+                if attempt >= 2:
+                    log("🧹 多次卡死：重启 Claude 常驻连接（自愈）")
+                    session_id = None
+                    try:
+                        _claude_helper_restart()
+                    except Exception as ex:
+                        log(f"重启 Claude 常驻连接异常: {str(ex)[:80]}")
+                else:
+                    log("🔧 单轮无事件超时：中断重试（保留会话上下文）")
+                time.sleep(3)
+            else:
+                with _claude_lock:
+                    if _claude_proc:
+                        try:
+                            _claude_proc.kill()
+                        except Exception:
+                            pass
+                        _claude_proc = None
+                time.sleep(3)
+    return None, session_id
+
+
+def claude_reply(prompt, session_id=None, on_progress=None, base=None, timeout=None):
+    """Claude Code 回复：优先常驻子进程（不冷启动），失败自动回退 spawn 模式。"""
+    reply, sid = _claude_reply_persistent(prompt, session_id, on_progress,
+                                          base=base, timeout=timeout)
+    if reply is not None:
+        return reply, sid
+    log("↩️ Claude 常驻通道失败，回退 spawn 模式")
+    return _claude_reply_spawn(prompt, session_id, on_progress, base=base)
+
+
+def _claude_reply_spawn(prompt, session_id=None, on_progress=None, base=None):
+    """（回退路径）调本机 Claude Code CLI（stream-json）生成回复。支持续接、进度转发与 /stop。"""
     global _active_codex_proc
     exe = CLAUDE_EXE
     if not exe or not os.path.exists(exe):
@@ -1005,14 +1251,17 @@ def claude_reply(prompt, session_id=None, on_progress=None):
     cmd_head = [exe]
     if exe.lower().endswith(".js"):
         cmd_head = [CODEX_NODE, exe]  # npm 包 bin 是 js 入口，需要 node 启动
-    base = cmd_head + ["-p", prompt, "--output-format", "stream-json",
+    full_prompt = prompt
+    if base and not session_id:
+        full_prompt = base.strip() + "\n\n" + prompt
+    cmd = cmd_head + ["-p", full_prompt, "--output-format", "stream-json",
             "--include-partial-messages", "--verbose", "--dangerously-skip-permissions"]
     if session_id:
-        base += ["--resume", session_id]
+        cmd += ["--resume", session_id]
     for attempt in range(3):
         _cancel_event.clear()
         try:
-            proc = subprocess.Popen(base, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
                                     errors="replace",
                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
@@ -1210,7 +1459,7 @@ def agent_reply(backend, prompt, session_id=None, on_progress=None, cfg=None,
                 preempt_evt=None, preempt_ctx=None):
     """按后端分派回复生成。"""
     if backend == "claude":
-        return claude_reply(prompt, session_id, on_progress)
+        return claude_reply(prompt, session_id, on_progress, base=base, timeout=timeout)
     if backend == "generic":
         return generic_reply(prompt, session_id, on_progress, (cfg or {}).get("generic") or {})
     return codex_reply(prompt, session_id, on_progress, model=model, effort=effort,

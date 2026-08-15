@@ -9,7 +9,7 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 
 - 微信 AI 通道：`scripts/wechat_bridge.py` 是「微信桥」，用户微信私聊机器人 → iLink Bot API → 本机 Agent CLI（Codex / Claude / 任意 CLI）生成回复 → 回发微信。
 - 微信 bot 只服务扫码绑定的那个微信号。
-- 常驻连接：Codex app-server 常驻进程，桥保持 WebSocket 长连接，不每条消息重启 Codex（回复更快，续聊复用同一线程）。
+- 常驻连接（2026-08-15 起 Codex / Claude 均常驻）：Codex 走 app-server + WebSocket 长连接；Claude 走 `scripts/claude_helper.py`（官方 Agent SDK 保持常驻 claude 子进程，`pip install claude-agent-sdk`）。两者都不再每条消息冷启动，多轮对话复用同一进程/线程，续聊不丢上下文。
 - 关键路径：
   - 桥脚本：`scripts/wechat_bridge.py`
   - 桥数据目录：`weixin_bridge/`（`account.json`、`state.json`、`bridge.log`、`backend.json`）
@@ -40,6 +40,7 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 - 干活不许闷头（人设 + 代码兜底）：模型按基础人设报计划/进度/总结；代码保证——单轮 25 秒无任何输出桥自动发「⏳ 还在处理中…」（60 秒节流），工具执行等事件作为活动心跳防误判卡死，不依赖模型自觉。
 - 任务/聊天车道（2026-08-15）：复杂任务进后台 FIFO 队列顺序执行（收到即回「任务已入队」），聊天走即时通道；任务执行中收到聊天 → 定向打断当前任务 turn（按 reqId）→ 聊天处理完 → 任务自动放回队首「从断点接着做」。
 - 事件按 turn 路由（2026-08-15，纯代码）：每个 turn 独立事件队列，读线程按 id 派发，`ready`/`exit` 才走共享队列——多任务并发结果/进度不互抢、不吞。
+- Claude 常驻（2026-08-15）：claude 后端优先走 `claude_helper.py` 常驻进程（CLAUDE.md/MCP 只在启动时加载一次），会话可续接、可切换（新会话自动重启子进程并 resume 磁盘 transcript）；helper 卡死由桥 HANG 检测 + 自动重启自愈；helper 不可用自动回退旧 spawn 模式保底。依赖：`pip install claude-agent-sdk`（与 Claude Code CLI 同时安装）。
 - 复杂任务不硬扛：Agent 明确告诉用户转交更强的桌面 Agent，简述进度与上下文，由部署方转交。
 - 桥记忆：`work_dir/wechat_memory.md` 每轮注入、对话后自动写回摘要（原子写、30 条滚动），线程重启不丢上下文。
 - 模型分工可配置：`backend.json` 的 `chat_model`/`chat_effort`/`task_model`/`task_effort`（默认对话/任务均为 `deepseek-v4-flash` + `medium`）；对话快速档、任务质量档，仅 Codex 后端生效。
