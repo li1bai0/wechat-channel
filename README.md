@@ -75,8 +75,8 @@
 ### 1. 准备
 
 ```bash
-git clone https://github.com/li1bai0/weixin.git
-cd weixin
+git clone https://github.com/li1bai0/wechat-channel.git
+cd wechat-channel
 pip install pycryptodome
 ```
 
