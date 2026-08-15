@@ -1240,7 +1240,7 @@ class Bridge:
             except Exception:
                 pass
         self.reply_q = deque()
-        self._q_evt = threading.Event()
+        self._q_cond = threading.Condition()
         self._send_ts = []
         self._send_lock = threading.Lock()
         for _t in self.state.pop("pending_replies", []) or []:
@@ -1540,8 +1540,9 @@ class Bridge:
             return
         level = classify_message(text)
         log(f"💬 收到消息（{level}）：{text[:30]}")
-        self.reply_q.appendleft(text)  # 新消息优先
-        self._q_evt.set()
+        with self._q_cond:
+            self.reply_q.appendleft(text)  # 新消息优先
+            self._q_cond.notify()
         self.save_state()
 
     def _get_typing_ticket(self):
@@ -1579,17 +1580,14 @@ class Bridge:
     # ── 回复工作线程池：Agent CLI → 微信（新消息优先，多消息并发） ──
     def _reply_worker_loop(self):
         while True:
-            self._q_evt.wait()
-            if not self.reply_q:
-                self._q_evt.clear()
-                continue
-            try:
+            with self._q_cond:
+                while not self.reply_q:
+                    self._q_cond.wait()
                 text = self.reply_q.popleft()
-            except IndexError:
-                self._q_evt.clear()
-                continue
-            self._q_evt.clear()
-            self._process_one(text)
+            try:
+                self._process_one(text)
+            except Exception as e:
+                log(f"⚠️ 回复线程异常: {e}")
 
     def _process_one(self, text):
         with _active_turns_lock:
