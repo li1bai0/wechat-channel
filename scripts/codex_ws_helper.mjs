@@ -156,6 +156,7 @@ rl.on("line", async (line) => {
     await startTurn(cmd);
   } else if (cmd.type === "interrupt") {
     for (const [turnId, st] of turns.entries()) {
+      if (cmd.reqId && st.reqId !== cmd.reqId) continue;
       try { await rpc("turn/interrupt", { threadId: st.threadId, turnId }); } catch {}
     }
   }

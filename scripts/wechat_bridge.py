@@ -590,6 +590,8 @@ _helper_out = None
 _helper_q = queue.Queue()
 _helper_reader = None
 _helper_lock = threading.Lock()
+_turn_queues = {}                 # req_id -> queue.Queue：事件按 turn 路由，防并发互抢饿死
+_turn_queues_lock = threading.Lock()
 _state_lock = threading.Lock()
 _active_turns = set()
 _active_turns_lock = threading.Lock()
@@ -634,6 +636,8 @@ def _helper_restart():
             _helper_in = None
             _helper_out = None
             _helper_q = queue.Queue()
+            with _turn_queues_lock:
+                _turn_queues.clear()
             _helper_reader = None
         if _app_server_proc and _app_server_proc.poll() is None:
             try:
@@ -655,8 +659,19 @@ def _helper_start_reader():
                 obj = json.loads(line)
             except Exception:
                 continue
-            _helper_q.put(obj)
+            rid = obj.get("id")
+            if rid:
+                with _turn_queues_lock:
+                    q = _turn_queues.get(rid)
+                if q is not None:
+                    q.put(obj)
+                    continue
+            _helper_q.put(obj)  # ready/无 id 事件：进共享队列
         _helper_q.put({"type": "exit"})
+        with _turn_queues_lock:
+            qs = list(_turn_queues.values())
+        for q in qs:
+            q.put({"type": "exit"})
 
     _helper_reader = threading.Thread(target=_read, daemon=True)
     _helper_reader.start()
@@ -680,6 +695,8 @@ def _helper_ensure():
         _helper_in = _helper_proc.stdin
         _helper_out = _helper_proc.stdout
         _helper_q = queue.Queue()
+        with _turn_queues_lock:
+            _turn_queues.clear()
     except Exception as e:
         log(f"助手启动失败: {str(e)[:120]}")
         return False
@@ -819,7 +836,8 @@ def _append_memory(entry):
         log(f"记忆写入失败: {str(e)[:80]}")
 
 
-def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=None, base=None, timeout=None):
+def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=None, base=None, timeout=None,
+                preempt_evt=None, preempt_ctx=None):
     """通过常驻 app-server 连接生成回复（不每条消息重启 Codex）。"""
     global _helper_proc
     hang_timeout = timeout or TURN_HANG_TIMEOUT
@@ -827,6 +845,8 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
         log("⚠️ Codex 模型服务不可达（本地代理未启动），跳过本轮")
         return None, session_id
     for attempt in range(3):
+        if preempt_evt is not None and preempt_evt.is_set():
+            return None, session_id
         _cancel_event.clear()
         with _helper_lock:
             ok = _helper_ensure()
@@ -835,56 +855,65 @@ def codex_reply(prompt, session_id=None, on_progress=None, model=None, effort=No
             return None, session_id
         try:
             req_id = uuid.uuid4().hex[:8]
-            payload = {"type": "turn", "id": req_id, "threadId": session_id,
-                       "prompt": prompt, "cwd": CODEX_WORK_DIR}
-            if model:
-                payload["model"] = model
-            if effort:
-                payload["effort"] = effort
-            if base:
-                payload["base"] = base
-            if not _helper_send(payload):
-                raise RuntimeError("助手未连接")
-            last_event = time.time()
-            last_alive = time.time()
-            while True:
-                if _cancel_event.is_set():
-                    return None, session_id
-                now = time.time()
-                if now - last_event > hang_timeout:
-                    try:
-                        _helper_send({"type": "interrupt"})
-                    except Exception:
-                        pass
-                    raise RuntimeError("HANG: 单轮无事件超时")
-                if now - last_alive >= ALIVE_NUDGE_INTERVAL and now - last_event >= ALIVE_NUDGE_S:
-                    try:
-                        if on_progress:
-                            on_progress("⏳ 还在处理中…")
-                    except Exception:
-                        pass
-                    last_alive = now
-                try:
-                    obj = _helper_q.get(timeout=5)
-                except queue.Empty:
-                    continue
+            if preempt_ctx is not None:
+                preempt_ctx["req_id"] = req_id
+            my_q = queue.Queue()
+            with _turn_queues_lock:
+                _turn_queues[req_id] = my_q
+            try:
+                payload = {"type": "turn", "id": req_id, "threadId": session_id,
+                           "prompt": prompt, "cwd": CODEX_WORK_DIR}
+                if model:
+                    payload["model"] = model
+                if effort:
+                    payload["effort"] = effort
+                if base:
+                    payload["base"] = base
+                if not _helper_send(payload):
+                    raise RuntimeError("助手未连接")
                 last_event = time.time()
-                t = obj.get("type")
-                if t == "exit":
-                    raise RuntimeError("助手退出")
-                if obj.get("id") != req_id:
-                    continue  # 其他并发 turn 的事件，忽略
-                if t == "progress" and on_progress:
+                last_alive = time.time()
+                while True:
+                    if _cancel_event.is_set():
+                        return None, session_id
+                    if preempt_evt is not None and preempt_evt.is_set():
+                        return None, session_id
+                    now = time.time()
+                    if now - last_event > hang_timeout:
+                        try:
+                            _helper_send({"type": "interrupt"})
+                        except Exception:
+                            pass
+                        raise RuntimeError("HANG: 单轮无事件超时")
+                    if now - last_alive >= ALIVE_NUDGE_INTERVAL and now - last_event >= ALIVE_NUDGE_S:
+                        try:
+                            if on_progress:
+                                on_progress("⏳ 还在处理中…")
+                        except Exception:
+                            pass
+                        last_alive = now
                     try:
-                        on_progress(obj.get("text") or "")
-                    except Exception:
-                        pass
-                elif t == "result":
-                    text = (obj.get("text") or "").strip()
-                    reply = _clean_final(text, set())
-                    return reply or None, obj.get("threadId") or session_id
-                elif t == "error":
-                    raise RuntimeError(obj.get("message") or "turn error")
+                        obj = my_q.get(timeout=5)
+                    except queue.Empty:
+                        continue
+                    last_event = time.time()
+                    t = obj.get("type")
+                    if t == "exit":
+                        raise RuntimeError("助手退出")
+                    if t == "progress" and on_progress:
+                        try:
+                            on_progress(obj.get("text") or "")
+                        except Exception:
+                            pass
+                    elif t == "result":
+                        text = (obj.get("text") or "").strip()
+                        reply = _clean_final(text, set())
+                        return reply or None, obj.get("threadId") or session_id
+                    elif t == "error":
+                        raise RuntimeError(obj.get("message") or "turn error")
+            finally:
+                with _turn_queues_lock:
+                    _turn_queues.pop(req_id, None)
         except Exception as e:
             msg = str(e)
             log(f"⚠️ Codex 常驻连接异常(第{attempt+1}次): {msg[:120]}")
@@ -1122,14 +1151,15 @@ def generic_reply(prompt, session_id=None, on_progress=None, cfg=None):
 
 
 def agent_reply(backend, prompt, session_id=None, on_progress=None, cfg=None,
-                model=None, effort=None, base=None, timeout=None):
+                model=None, effort=None, base=None, timeout=None,
+                preempt_evt=None, preempt_ctx=None):
     """按后端分派回复生成。"""
     if backend == "claude":
         return claude_reply(prompt, session_id, on_progress)
     if backend == "generic":
         return generic_reply(prompt, session_id, on_progress, (cfg or {}).get("generic") or {})
     return codex_reply(prompt, session_id, on_progress, model=model, effort=effort,
-                       base=base, timeout=timeout)
+                       base=base, timeout=timeout, preempt_evt=preempt_evt, preempt_ctx=preempt_ctx)
 
 
 # ───────────────────────── 注册（QR 扫码） ─────────────────────────
@@ -1241,6 +1271,12 @@ class Bridge:
                 pass
         self.reply_q = deque()
         self._q_cond = threading.Condition()
+        self.task_q = deque()          # 后台任务队列（FIFO 顺序执行）
+        self._task_cond = threading.Condition()
+        self._task_preempt = threading.Event()   # 聊天到达时置位：任务让位
+        self._chat_active = 0                    # 当前正在处理的聊天数
+        self._running_task = {"active": False, "sid": None, "desc": "", "req_id": None}
+        self._resume_task = None                 # 被打断待恢复的任务（队首优先）
         self._send_ts = []
         self._send_lock = threading.Lock()
         for _t in self.state.pop("pending_replies", []) or []:
@@ -1250,6 +1286,9 @@ class Bridge:
             if leftover:
                 log(f"♻️ 上次中断时正在处理的消息补回队列: {leftover[:40]}")
                 self.reply_q.appendleft(leftover)
+        for _t in self.state.pop("task_queue", []) or []:
+            if _t:
+                self.task_q.append(_t)
         self.cb = _CircuitBreaker(self.account.get("account_id", "bridge"))
         self._last_poll_ts = time.time()
         self._retry_queue_flush_ts = 0.0
@@ -1269,6 +1308,10 @@ class Bridge:
             self.state["seen"] = self.state["seen"][-200:]
             try:
                 self.state["pending_replies"] = list(self.reply_q)
+            except Exception:
+                pass
+            try:
+                self.state["task_queue"] = list(self.task_q)
             except Exception:
                 pass
             tmp = STATE_FILE.with_suffix(".tmp")
@@ -1540,6 +1583,18 @@ class Bridge:
             return
         level = classify_message(text)
         log(f"💬 收到消息（{level}）：{text[:30]}")
+        if level == "complex":
+            # 复杂任务：进后台任务队列，FIFO 顺序执行，不占聊天通道
+            with self._task_cond:
+                self.task_q.append(text)
+                self._task_cond.notify()
+            self.send_typing()
+            self.send_weixin("收到，任务已入队，会按顺序执行并实时报进度。")
+            self.save_state()
+            return
+        # 对话消息：新消息优先；若后台任务在跑，先打断它，任务处理完聊天后自动恢复
+        if self._running_task.get("active"):
+            self._preempt_task()
         with self._q_cond:
             self.reply_q.appendleft(text)  # 新消息优先
             self._q_cond.notify()
@@ -1584,20 +1639,32 @@ class Bridge:
                 while not self.reply_q:
                     self._q_cond.wait()
                 text = self.reply_q.popleft()
+            with _active_turns_lock:
+                self._chat_active += 1
             try:
                 self._process_one(text)
             except Exception as e:
                 log(f"⚠️ 回复线程异常: {e}")
+            finally:
+                with _active_turns_lock:
+                    self._chat_active -= 1
 
     def _process_one(self, text):
         with _active_turns_lock:
-            parallel = bool(_active_turns)
+            parallel = self._chat_active > 1
             token = uuid.uuid4().hex
             _active_turns.add(token)
         self.state.setdefault("processing", []).append(text)
         self.save_state()
         try:
             level = classify_message(text)
+            if level == "complex":
+                # 兜底：复杂任务一律转后台任务队列（FIFO），不占聊天通道
+                with self._task_cond:
+                    self.task_q.append(text)
+                    self._task_cond.notify()
+                self.save_state()
+                return
             sid = self.state.get("codex_session")
             if parallel:
                 sid = None  # 并行模式：新开线程独立处理，不占用主会话
@@ -1655,6 +1722,110 @@ class Bridge:
             except Exception:
                 pass
             self.save_state()
+
+    def _task_worker_loop(self):
+        """后台任务线程：FIFO 顺序执行；被聊天打断后自动恢复。"""
+        while True:
+            with self._task_cond:
+                while not self.task_q:
+                    self._task_cond.wait()
+                text = self.task_q.popleft()
+            try:
+                self._process_task(text)
+            except Exception as e:
+                log(f"⚠️ 任务线程异常: {e}")
+
+    def _process_task(self, text):
+        """后台执行复杂任务；聊天打断时保存恢复标记，聊天结束后自动续做。"""
+        preempt_evt = self._task_preempt
+        preempt_ctx = self._running_task   # codex_reply 会把当前 turn 的 req_id 实时写进来
+        resume_sid = None
+        if self._resume_task and self._resume_task.get("desc") == text:
+            resume_sid = self._resume_task.pop("sid", None)
+            self._resume_task = None
+        with _active_turns_lock:
+            token = uuid.uuid4().hex
+            _active_turns.add(token)
+        self.state.setdefault("processing", []).append(text)
+        self.save_state()
+        try:
+            identity = BACKEND_IDENTITY.get(self.backend, "Codex")
+            mem = _load_memory()
+            memory_block = ("【微信桥记忆】\n" + mem + "\n\n") if mem else ""
+            if resume_sid:
+                prompt = ("继续执行刚才被打断的任务，从断点接着做，完成后按协议汇报。任务内容：\n" + text)
+                base_prompt = ""
+                sid = resume_sid
+            else:
+                prompt = text
+                base_prompt = PRIMER.format(identity=identity)
+                sid = None
+            if self.backend == "codex":
+                prompt = memory_block + SYSTEM_HINT.format(identity=identity) + prompt
+            else:
+                prompt = memory_block + prompt
+            prompt += TASK_PROTOCOL
+            self._running_task.update({"sid": sid, "desc": text, "active": True, "req_id": None})
+            reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=self.send_weixin,
+                                         cfg=self.backend_cfg, model=TASK_MODEL, effort=TASK_EFFORT,
+                                         base=base_prompt or None, timeout=TURN_HANG_TIMEOUT_TASK,
+                                         preempt_evt=preempt_evt, preempt_ctx=preempt_ctx)
+            self._running_task.update({"active": False, "sid": new_sid or sid, "req_id": None})
+            if preempt_evt.is_set():
+                # 被打断：保存恢复标记，等聊天清空后放回队首自动续做
+                preempt_evt.clear()
+                self._resume_task = {"sid": new_sid or sid, "desc": text}
+                log(f"⏸️ 任务被新消息打断，聊天结束后自动恢复: {text[:30]}")
+                deadline = time.time() + 180
+                while (self.reply_q or self._chat_active > 0) and time.time() < deadline:
+                    time.sleep(0.5)
+                with self._task_cond:
+                    self.task_q.appendleft(text)
+                    self._task_cond.notify()
+                return
+            if reply:
+                reply, files = _extract_files(reply)
+                for fp in files:
+                    p = Path(fp).expanduser()
+                    if not p.is_absolute():
+                        p = Path(CODEX_WORK_DIR) / p
+                    try:
+                        if not self.send_file(str(p)):
+                            self.send_weixin(f"文件发送失败：{fp}")
+                    except Exception as e:
+                        log(f"发送文件异常: {str(e)[:120]}")
+                        self.send_weixin(f"文件发送失败：{str(e)[:80]}")
+                if reply.strip():
+                    self.send_weixin(reply)
+                self._record_session(new_sid or sid, text)
+                _append_memory(f"- {datetime.now():%Y-%m-%d %H:%M} | 任务：{text[:60]} → 结果：{reply[:80]}")
+            else:
+                self.send_weixin("（任务执行失败，稍后我重新试一次）")
+        except Exception as e:
+            log(f"⚠️ 任务处理异常: {e}")
+        finally:
+            with _active_turns_lock:
+                _active_turns.discard(token)
+            try:
+                self.state["processing"].remove(text)
+            except Exception:
+                pass
+            self.save_state()
+
+    def _preempt_task(self):
+        """新消息优先：打断当前后台任务（按 reqId 定向中断，任务自动恢复）。"""
+        with self._task_cond:
+            if not self._running_task.get("active"):
+                return
+            self._task_preempt.set()
+        req = self._running_task.get("req_id")
+        try:
+            if req:
+                _helper_send({"type": "interrupt", "reqId": req})
+            else:
+                _helper_send({"type": "interrupt"})
+        except Exception:
+            pass
 
     def _record_session(self, sid, text):
         if not sid:
@@ -1846,14 +2017,16 @@ class Bridge:
         t1 = threading.Thread(target=lambda: self._guarded("ilink", self.ilink_loop), daemon=True)
         t2a = threading.Thread(target=lambda: self._guarded("reply", self._reply_worker_loop), daemon=True)
         t2b = threading.Thread(target=lambda: self._guarded("reply", self._reply_worker_loop), daemon=True)
+        t2c = threading.Thread(target=lambda: self._guarded("task", self._task_worker_loop), daemon=True)
         t3 = threading.Thread(target=lambda: self._guarded("watchdog", self.watchdog), daemon=True)
         t1.start()
         t2a.start()
         t2b.start()
+        t2c.start()
         t3.start()
         while True:
             time.sleep(60)
-            if not t1.is_alive() or not t2a.is_alive() or not t2b.is_alive():
+            if not t1.is_alive() or not t2a.is_alive() or not t2b.is_alive() or not t2c.is_alive():
                 log("⚠️ 子线程退出，重启桥进程")
                 os._exit(1)
 
