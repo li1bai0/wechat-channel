@@ -167,13 +167,17 @@ REBIND_ATTEMPT_COOLDOWN = 3600     # 自动重绑二维码触发冷却
 EXPIRY_REBIND_THRESHOLD = 6        # 连续 -14 轮数（约 1 小时）后才判定真失效，触发重绑提醒
 SEND_RATE_LIMIT = 8                # 微信侧约 10 条/分钟上限，留余量主动限流
 SEND_RATE_WINDOW = 60              # 限流窗口秒数
-MAX_MSG_LEN = 4000                 # 单条微信消息长度上限（markdown 感知分片）
+MAX_MSG_LEN = 1000                 # 单条微信消息长度上限：长回复自动分段成多条短消息，微信阅读友好
 POLL_TIMEOUT = 45                  # getupdates 长轮询默认超时秒数（跟随服务端 longpolling_timeout_ms 调整）
 
 SYSTEM_HINT = ("你是{identity}，正在微信里和用户私聊。像日常聊天一样自然回复："
                "口语化、直接、一两句话（内容需要时可以稍长），不要markdown列表、"
                "不要项目符号、不要客套前缀。这是微信后台通道：除非用户明确要求，"
-               "不要执行任何语音播报，也不要提起自己是后台进程。用户的消息：\n")
+               "不要执行任何语音播报，也不要提起自己是后台进程。\n"
+               "回复规矩：绝对不要一大段文字堆在一起——先说结论、再补关键细节，"
+               "一条回复尽量控制在几条短消息内（总长 ~600 字内）；一行一个意思，"
+               "需要多条时每条说一个要点，宁可分条也别堆成整段；"
+               "能用一句话说清绝不多写，长内容只挑重点。用户的消息：\n")
 
 PRIMER = (
     "【本体底稿】你是 {identity}，用户给你开的微信专线，这个微信 bot 只服务扫码绑定的那个用户。"
@@ -187,7 +191,9 @@ PRIMER = (
     "干活不许闷着头：只要是在做事（不是纯聊天），动手前先一句话告诉用户你要做什么；"
     "过程中每完成一个关键步骤或节点，主动发一句进展（这一步做了什么、结果如何）；"
     "卡住或需要长时间等待时，主动说明当前状态；全部完成后给一句总结。"
-    "宁可多报不可少报，绝不长时间无声无息。\n\n"
+    "宁可多报不可少报，绝不长时间无声无息。\n"
+    "回复一律精简：微信里说话简短直接、先结论后细节，长内容拆成几条短消息分开发，"
+    "绝不把一大段文字堆在一起。\n\n"
     "遇到复杂任务（大型开发、系统级改动、长流程工程）不要硬扛："
     "明确告诉用户'这个任务交给更强的桌面 Agent 更稳'，简要说明已做进度和关键上下文，由部署方转交。\n\n"
 )
@@ -923,15 +929,43 @@ def _extract_files(reply):
     return cleaned, files
 
 
+def _cut_paragraph(text, max_len):
+    """把一段文字按句子切成 ≤max_len 的语义块（中英文句号/问号/叹号/分号断句）。"""
+    if len(text) <= max_len:
+        return [text]
+    parts = re.split(r"(?<=[。！？!?；;])\s*|\n+", text)
+    chunks = []
+    buf = ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > max_len:
+            if buf:
+                chunks.append(buf)
+                buf = ""
+            for j in range(0, len(p), max_len):
+                chunks.append(p[j:j + max_len])
+        elif len(buf) + len(p) + 1 > max_len:
+            chunks.append(buf)
+            buf = p
+        else:
+            buf = (buf + "\n" + p) if buf else p
+    if buf:
+        chunks.append(buf)
+    return [c for c in chunks if c and c.strip()]
+
+
 def _split_weixin_text(text, max_len=MAX_MSG_LEN):
-    """markdown 感知分片：代码块整体一个单元，单元打包成 ≤max_len 的分片，超长单元拆围栏硬切。"""
+    """微信友好分片：段落/句子感知，代码块整体保留；长回复自动切成多条短消息。"""
     text = str(text or "")
     if not text:
         return []
     if len(text) <= max_len and "\n" not in text:
         return [text]
+    # 1. 先把代码块和普通行区分开
     lines = text.split("\n")
-    units = []
+    units = []  # (text, is_code)
     i, n = 0, len(lines)
     while i < n:
         if lines[i].strip().startswith("```"):
@@ -943,25 +977,25 @@ def _split_weixin_text(text, max_len=MAX_MSG_LEN):
             if i < n:
                 block.append(lines[i])
                 i += 1
-            units.append("\n".join(block))
+            units.append(("\n".join(block), True))
         else:
-            units.append(lines[i])
+            units.append((lines[i], False))
             i += 1
-
+    # 2. 普通文本按空行分段（一段一个语义块），段落超长按句子切；代码块整体保留
     chunks = []
-    buf = []
-    buf_len = 0
+    para = []
 
-    def flush():
-        nonlocal buf, buf_len
-        if buf:
-            chunks.append("\n".join(buf))
-            buf, buf_len = [], 0
+    def flush_para():
+        nonlocal para
+        if para:
+            for seg in _cut_paragraph("\n".join(para), max_len):
+                chunks.append(seg)
+            para = []
 
-    for u in units:
-        if len(u) > max_len:
-            flush()
-            if u.strip().startswith("```"):
+    for u, is_code in units:
+        if is_code:
+            flush_para()
+            if len(u) > max_len:
                 open_line, rest = u.split("\n", 1)
                 close = ""
                 if rest.rstrip().endswith("```"):
@@ -973,15 +1007,13 @@ def _split_weixin_text(text, max_len=MAX_MSG_LEN):
                 if close:
                     chunks.append(close)
             else:
-                for j in range(0, len(u), max_len):
-                    chunks.append(u[j:j + max_len])
-            continue
-        if buf_len + len(u) + 1 > max_len:
-            flush()
-        buf.append(u)
-        buf_len += len(u) + 1
-    flush()
-    return [c for c in chunks if c]
+                chunks.append(u)
+        elif u.strip() == "":
+            flush_para()
+        else:
+            para.append(u)
+    flush_para()
+    return [c for c in chunks if c and c.strip()]
 
 
 def _load_memory():
