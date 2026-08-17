@@ -167,7 +167,8 @@ REBIND_ATTEMPT_COOLDOWN = 3600     # 自动重绑二维码触发冷却
 EXPIRY_REBIND_THRESHOLD = 6        # 连续 -14 轮数（约 1 小时）后才判定真失效，触发重绑提醒
 SEND_RATE_LIMIT = 8                # 微信侧约 10 条/分钟上限，留余量主动限流
 SEND_RATE_WINDOW = 60              # 限流窗口秒数
-MAX_MSG_LEN = 1000                 # 单条微信消息长度上限：长回复自动分段成多条短消息，微信阅读友好
+MAX_MSG_LEN = 1000                 # 单条微信消息长度上限：代码块等整体单元的硬切上限
+SPLIT_TARGET = 50                  # 普通文本切片目标：回复超 50 字一律按句子切片，一条一条发
 POLL_TIMEOUT = 45                  # getupdates 长轮询默认超时秒数（跟随服务端 longpolling_timeout_ms 调整）
 
 SYSTEM_HINT = ("你是{identity}，正在微信里和用户私聊。像日常聊天一样自然回复："
@@ -177,7 +178,8 @@ SYSTEM_HINT = ("你是{identity}，正在微信里和用户私聊。像日常聊
                "回复规矩：绝对不要一大段文字堆在一起——先说结论、再补关键细节，"
                "一条回复尽量控制在几条短消息内（总长 ~600 字内）；一行一个意思，"
                "需要多条时每条说一个要点，宁可分条也别堆成整段；"
-               "能用一句话说清绝不多写，长内容只挑重点。用户的消息：\n")
+               "能用一句话说清绝不多写，长内容只挑重点；只讲结论和必要细节，"
+               "删掉客套、过程描述和无关铺垫。用户的消息：\n")
 
 PRIMER = (
     "【本体底稿】你是 {identity}，用户给你开的微信专线，这个微信 bot 只服务扫码绑定的那个用户。"
@@ -990,7 +992,12 @@ def _split_weixin_text(text, max_len=MAX_MSG_LEN):
     text = str(text or "")
     if not text:
         return []
-    if len(text) <= max_len and "\n" not in text:
+    if "\n" not in text:
+        # 无换行的单段文本：超过 50 字按句子切成多条，短文本一条发
+        if len(text) <= SPLIT_TARGET:
+            return [text]
+        return _cut_paragraph(text, SPLIT_TARGET)
+    if len(text) <= SPLIT_TARGET:
         return [text]
     # 1. 先把代码块和普通行区分开
     lines = text.split("\n")
@@ -1017,7 +1024,7 @@ def _split_weixin_text(text, max_len=MAX_MSG_LEN):
     def flush_para():
         nonlocal para
         if para:
-            for seg in _cut_paragraph("\n".join(para), max_len):
+            for seg in _cut_paragraph("\n".join(para), SPLIT_TARGET):
                 chunks.append(seg)
             para = []
 
