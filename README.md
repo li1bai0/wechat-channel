@@ -26,7 +26,7 @@
 - 按步骤汇报：大型任务先报计划 → 每完成一步报一声 → 最后总结（不按时间机械刷屏）
 - 干活不许闷头（人设 + 代码兜底）：模型按基础人设报计划/进度/总结；代码保证——单轮 25 秒无任何输出桥自动发「还在处理中」（60 秒节流），工具执行等事件作为活动心跳防误判卡死，不依赖模型自觉
 - 桥记忆：`wechat_memory.md` 每轮注入 + 对话后自动写回摘要，线程重启不丢上下文
-- 模型可配置：`backend.json` 的 `chat_model`/`chat_effort`/`task_model`/`task_effort` 可分别设对话与任务档位
+- 模型可配置：`backend.json` 的 `chat_model`/`chat_effort`/`task_model`/`task_effort`/`casual_effort` 可分别设对话/任务/简单消息档位（简单消息默认低推理省 token；任务失败自动用对话档重试一次）
 - 文件互传：微信发文件/图片给 Agent；Agent 产出的文件自动发回微信（AES-128-ECB，上限 50MB）
 - 会话管理：/sessions 列表、/resume N 切回、/new 开新会话
 - 稳定性加固：熔断器+指数退避、会话过期自动重出二维码、发送失败落盘重试、轮询看门狗、单实例锁、单一 bot 稳定连接
@@ -65,7 +65,7 @@
 ### 环境要求
 
 - Windows / macOS / Linux 均可运行（守护方式：Windows 用计划任务/守护脚本，macOS/Linux 用 launchd/systemd 自配）
-- Python 3.10+，`pip install pycryptodome`
+- Python 3.10+，`pip install pycryptodome`；claude 后端常驻另需 `pip install claude-agent-sdk`（未装则自动回退一次性 spawn，不影响使用）
 - Node.js 18+（Codex 后端需要它跑常驻 WS 助手）
 - 至少一个 Agent，且**首次使用先在本机登录**：
   - Codex：`codex login`（或已有 `~/.codex/auth.json`）；自动探测原生 CLI 二进制（`~/.codex/bin/codex` / PATH）或 npm 安装（`@openai/codex`）
@@ -107,7 +107,9 @@ Windows 建议用 `pythonw` 后台运行，并配合任务计划/守护脚本保
 - `"backend": "claude"` → Claude Code（需要 Claude 登录或 ANTHROPIC_API_KEY）
 - `"backend": "generic"` → 任意 CLI Agent，配置 `generic.new_cmd` / `generic.resume_cmd`（`{prompt}`、`{session}` 占位符）与 `session_regex`
 
-模型与推理档位也可配置：`chat_model` / `chat_effort`（对话，默认 `deepseek-v4-flash` + `medium`，快速响应）、`task_model` / `task_effort`（任务，默认同档）。仅 Codex 后端生效。
+模型与推理档位也可配置：`chat_model` / `chat_effort`（对话，默认 `deepseek-v4-flash` + `medium`，快速响应）、`task_model` / `task_effort`（任务，默认同档）、`casual_effort`（问候/确认类简单消息，默认 `low` 低推理省 token）。仅 Codex 后端生效；复杂任务 task 档失败会自动用对话档重试一次（被打断/停止时不重试）。
+
+> **Claude 常驻（2026-08-15）**：claude 后端默认走 `claude_helper.py` 常驻进程（CLAUDE.md/MCP 只在启动时加载一次，多轮对话复用同一进程、可续接可切换会话），需要 `pip install claude-agent-sdk`；helper 不可用时桥自动回退一次性 spawn 模式保底。
 
 > **Windows 注意（开箱即用）**：`claude_exe` 留空即可自动探测——按顺序找 `PATH 里的 claude`、npm 全局 `claude.cmd`/`claude`、原生安装的 `~/.local/bin/claude.exe`、npm 包内 `claude.js`（自动用 node 启动）。不要手填 `node_modules\@anthropic-ai\claude-code\bin\claude.exe`（Windows 上不存在）；`.cmd` 壳已由桥直接处理，无需额外配置。
 
