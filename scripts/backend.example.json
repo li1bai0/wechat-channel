@@ -6,6 +6,7 @@
   "work_dir": "C:\\Users\\<you>\\wechat_work",
   "chat_model": "deepseek-v4-flash",
   "chat_effort": "medium",
+  "casual_effort": "low",
   "task_model": "deepseek-v4-flash",
   "task_effort": "medium",
   "generic": {

@@ -43,7 +43,7 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 - Claude 常驻（2026-08-15）：claude 后端优先走 `claude_helper.py` 常驻进程（CLAUDE.md/MCP 只在启动时加载一次），会话可续接、可切换（新会话自动重启子进程并 resume 磁盘 transcript）；helper 卡死由桥 HANG 检测 + 自动重启自愈；helper 不可用自动回退旧 spawn 模式保底。依赖：`pip install claude-agent-sdk`（与 Claude Code CLI 同时安装）。
 - 复杂任务不硬扛：Agent 明确告诉用户转交更强的桌面 Agent，简述进度与上下文，由部署方转交。
 - 桥记忆：`work_dir/wechat_memory.md` 每轮注入、对话后自动写回摘要（原子写、30 条滚动），线程重启不丢上下文。
-- 模型分工可配置：`backend.json` 的 `chat_model`/`chat_effort`/`task_model`/`task_effort`（默认对话/任务均为 `deepseek-v4-flash` + `medium`）；对话快速档、任务质量档，仅 Codex 后端生效。
+- 模型分工可配置：`backend.json` 的 `chat_model`/`chat_effort`/`task_model`/`task_effort`/`casual_effort`（默认对话/任务 `deepseek-v4-flash` + `medium`，简单消息 `casual_effort=low` 降推理省 token）；复杂任务 task 档失败自动降级 chat 档重试一次（不被打断/未停止时），仅 Codex 后端生效。
 - 禁止自改：人设明确规定 Agent 不得自行修改桥配置/模型/数据库或重启服务；收到这类请求回复由部署方处理，绝不假装已改。
 - 长命令不误杀（纯代码）：助手把工具执行/命令输出/文件变更等事件上报为活动心跳，桥只在真正无动静时才判定卡死。
 - 文件互传：用户发来图片/文件 → 桥自动下载并 AES 解密，存到 `work_dir/inbox/`，路径随消息交给 Agent；Agent 产出文件时在最终回复输出【文件】<完整路径>，桥自动上传发回微信（图片按图片消息，其余按文件消息，上限 50MB）。

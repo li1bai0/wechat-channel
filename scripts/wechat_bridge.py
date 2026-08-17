@@ -82,6 +82,7 @@ TURN_HANG_TIMEOUT_TASK = 300  # 任务：执行命令时可能长时间无文本
 # 模型分工（2026-08-14 稳定版）：对话用快速档保证秒回，任务用质量档；可在 backend.json 覆盖
 CHAT_MODEL = "deepseek-v4-flash"
 CHAT_EFFORT = "medium"
+CASUAL_EFFORT = "low"              # 简单消息（问候/确认）用低推理档，省 token（backend.json 可覆盖）
 TASK_MODEL = "deepseek-v4-flash"
 TASK_EFFORT = "medium"
 ALIVE_NUDGE_S = 25                 # 代码级保活：单轮超 N 秒无任何输出，主动发“还在处理中”
@@ -1980,14 +1981,12 @@ class Bridge:
             prompt = memory_block + SYSTEM_HINT.format(identity=identity) + text
             base_prompt = PRIMER.format(identity=identity) if not sid else ""
             on_progress = self.send_weixin
-            if level == "complex":
-                prompt += TASK_PROTOCOL
             cfg = self.backend_cfg or {}
-            turn_model, turn_effort = ((cfg.get("task_model") or TASK_MODEL,
-                                        cfg.get("task_effort") or TASK_EFFORT)
-                                       if level == "complex" else
-                                       (cfg.get("chat_model") or CHAT_MODEL,
-                                        cfg.get("chat_effort") or CHAT_EFFORT))
+            chat_model = cfg.get("chat_model") or CHAT_MODEL
+            chat_effort = cfg.get("chat_effort") or CHAT_EFFORT
+            casual_effort = cfg.get("casual_effort") or CASUAL_EFFORT
+            # 简单消息降推理档省 token；普通对话用 chat 档；复杂任务由 _process_task 用 task 档处理
+            turn_model, turn_effort = (chat_model, casual_effort if level == "casual" else chat_effort)
             turn_timeout = TURN_HANG_TIMEOUT_TASK if level == "complex" else TURN_HANG_TIMEOUT
             reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=on_progress,
                                          cfg=self.backend_cfg, model=turn_model, effort=turn_effort,
@@ -2072,10 +2071,22 @@ class Bridge:
                 prompt = memory_block + prompt
             prompt += TASK_PROTOCOL
             self._running_task.update({"sid": sid, "desc": text, "active": True, "req_id": None})
+            cfg = self.backend_cfg or {}
+            task_model = cfg.get("task_model") or TASK_MODEL
+            task_effort = cfg.get("task_effort") or TASK_EFFORT
+            chat_model = cfg.get("chat_model") or CHAT_MODEL
+            chat_effort = cfg.get("chat_effort") or CHAT_EFFORT
             reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=self.send_weixin,
-                                         cfg=self.backend_cfg, model=TASK_MODEL, effort=TASK_EFFORT,
+                                         cfg=self.backend_cfg, model=task_model, effort=task_effort,
                                          base=base_prompt or None, timeout=TURN_HANG_TIMEOUT_TASK,
                                          preempt_evt=preempt_evt, preempt_ctx=preempt_ctx)
+            if not reply and not preempt_evt.is_set() and not _cancel_event.is_set():
+                # task 档失败：用 chat 档重试一次（配置不同即降档；相同也是多一次瞬时错误兜底）
+                log("↩️ task 档失败，用 chat 档重试一次")
+                reply, new_sid = agent_reply(self.backend, prompt, sid, on_progress=self.send_weixin,
+                                             cfg=self.backend_cfg, model=chat_model, effort=chat_effort,
+                                             base=base_prompt or None, timeout=TURN_HANG_TIMEOUT_TASK,
+                                             preempt_evt=preempt_evt, preempt_ctx=preempt_ctx)
             self._running_task.update({"active": False, "sid": new_sid or sid, "req_id": None})
             if preempt_evt.is_set():
                 # 被打断：保存恢复标记，等聊天清空后放回队首自动续做
