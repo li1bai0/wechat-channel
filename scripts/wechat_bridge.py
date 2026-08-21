@@ -168,7 +168,8 @@ EXPIRY_REBIND_THRESHOLD = 6        # 连续 -14 轮数（约 1 小时）后才�
 SEND_RATE_LIMIT = 8                # 微信侧约 10 条/分钟上限，留余量主动限流
 SEND_RATE_WINDOW = 60              # 限流窗口秒数
 MAX_MSG_LEN = 1000                 # 单条微信消息长度上限：代码块等整体单元的硬切上限
-SPLIT_TARGET = 50                  # 普通文本切片目标：回复超 50 字一律按句子切片，一条一条发
+SPLIT_TARGET = 100                 # 普通文本切片目标：回复超 100 字才按句子切片，减少条数
+MAX_REPLY_PARTS = 5                # 单次回复最多发5条：iLink 对单条入站消息回复有约10条硬限制，超出会被吞
 POLL_TIMEOUT = 45                  # getupdates 长轮询默认超时秒数（跟随服务端 longpolling_timeout_ms 调整）
 
 SYSTEM_HINT = ("你是{identity}，正在微信里和用户私聊。像日常聊天一样自然回复："
@@ -978,8 +979,16 @@ def _cut_paragraph(text, max_len):
             if buf:
                 chunks.append(buf)
                 buf = ""
-            for j in range(0, len(p), max_len):
-                chunks.append(p[j:j + max_len])
+            start, n = 0, len(p)
+            while start < n:
+                remain = n - start
+                # 尾巴太短（≤15字）并入当前块，避免「没关系」这种孤字单独成条
+                if remain > max_len and remain - max_len <= 15:
+                    chunks.append(p[start:])
+                    start = n
+                else:
+                    chunks.append(p[start:start + max_len])
+                    start += max_len
         elif len(buf) + len(p) + 1 > max_len:
             chunks.append(buf)
             buf = p
@@ -990,16 +999,25 @@ def _cut_paragraph(text, max_len):
     return [c for c in chunks if c and c.strip()]
 
 
+def _cap_parts(chunks, max_parts=MAX_REPLY_PARTS):
+    """回复条数上限保护：超出 max_parts 条的尾部合并进最后一条，避免 iLink 吞消息。"""
+    if len(chunks) <= max_parts:
+        return chunks
+    head = chunks[:max_parts - 1]
+    tail = "\n".join(chunks[max_parts - 1:])
+    return head + [tail]
+
+
 def _split_weixin_text(text, max_len=MAX_MSG_LEN):
     """微信友好分片：段落/句子感知，代码块整体保留；长回复自动切成多条短消息。"""
     text = str(text or "")
     if not text:
         return []
     if "\n" not in text:
-        # 无换行的单段文本：超过 50 字按句子切成多条，短文本一条发
+        # 无换行的单段文本：超过 SPLIT_TARGET 字按句子切成多条，短文本一条发
         if len(text) <= SPLIT_TARGET:
             return [text]
-        return _cut_paragraph(text, SPLIT_TARGET)
+        return _cap_parts(_cut_paragraph(text, SPLIT_TARGET))
     if len(text) <= SPLIT_TARGET:
         return [text]
     # 1. 先把代码块和普通行区分开
@@ -1052,7 +1070,7 @@ def _split_weixin_text(text, max_len=MAX_MSG_LEN):
         else:
             para.append(u)
     flush_para()
-    return [c for c in chunks if c and c.strip()]
+    return _cap_parts([c for c in chunks if c and c.strip()])
 
 
 def _load_memory():
