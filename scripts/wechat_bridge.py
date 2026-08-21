@@ -1675,11 +1675,16 @@ class Bridge:
         self._resume_task = None                 # 被打断待恢复的任务（队首优先）
         self._send_ts = []
         self._send_lock = threading.Lock()
+        replied_fps = set(self.state.get("replied_fps") or [])
         for _t in self.state.pop("pending_replies", []) or []:
             if _t:
                 self.reply_q.appendleft(_t)
         for leftover in (self.state.pop("processing", None) or []):
             if leftover:
+                fp = hashlib.md5((self.account.get("user_id", "") + "|" + leftover).encode("utf-8")).hexdigest()
+                if fp in replied_fps:
+                    log(f"♻️ 跳过补回（已回复过）: {leftover[:30]}")
+                    continue
                 log(f"♻️ 上次中断时正在处理的消息补回队列: {leftover[:40]}")
                 self.reply_q.appendleft(leftover)
         for _t in self.state.pop("task_queue", []) or []:
@@ -1714,6 +1719,16 @@ class Bridge:
             tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, STATE_FILE)
             self._persist_account_state(self.account, self.state)
+
+    def _mark_replied(self, text):
+        """记录已成功回复的入站消息指纹，重启补回队列时跳过，防止重复回复。"""
+        try:
+            fp = hashlib.md5((self.account.get("user_id", "") + "|" + text).encode("utf-8")).hexdigest()
+            fps = self.state.setdefault("replied_fps", [])
+            fps.append(fp)
+            self.state["replied_fps"] = fps[-100:]
+        except Exception:
+            pass
 
     def _persist_account_state(self, account, state):
         try:
@@ -2099,6 +2114,7 @@ class Bridge:
                         self.send_weixin(f"文件发送失败：{str(e)[:80]}")
                 if reply.strip():
                     self.send_weixin(reply)
+                    self._mark_replied(text)
                 if not parallel:
                     self._record_session(new_sid, text)
                     _append_memory(f"- {datetime.now():%Y-%m-%d %H:%M} | 用户：{text[:60]} → 桥：{reply[:80]}")
@@ -2210,6 +2226,7 @@ class Bridge:
                         self.send_weixin(f"文件发送失败：{str(e)[:80]}")
                 if reply.strip():
                     self.send_weixin(reply)
+                    self._mark_replied(text)
                 self._record_session(new_sid or sid, text)
                 _append_memory(f"- {datetime.now():%Y-%m-%d %H:%M} | 任务：{text[:60]} → 结果：{reply[:80]}")
             else:
