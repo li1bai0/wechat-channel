@@ -1980,12 +1980,13 @@ class Bridge:
         level = classify_message(text)
         log(f"💬 收到消息（{level}）：{text[:30]}")
         if level == "complex":
-            # 复杂任务：进后台任务队列，FIFO 顺序执行，不占聊天通道
+            # 复杂任务：进后台任务队列，最新任务优先（appendleft），不占聊天通道
             with self._task_cond:
-                self.task_q.append(text)
+                self.task_q.appendleft(text)
                 self._task_cond.notify()
             self.send_typing()
-            self.send_weixin("收到，任务已入队，会按顺序执行并实时报进度。")
+            preview = text[:50] + ("…" if len(text) > 50 else "")
+            self.send_weixin(f"收到，任务已入队（最新优先）：{preview}，会按顺序执行并实时报进度。")
             self.save_state()
             return
         # 对话消息：新消息优先；若后台任务在跑，先打断它，任务处理完聊天后自动恢复
@@ -2055,9 +2056,9 @@ class Bridge:
         try:
             level = classify_message(text)
             if level == "complex":
-                # 兜底：复杂任务一律转后台任务队列（FIFO），不占聊天通道
+                # 兜底：复杂任务一律转后台任务队列（最新优先），不占聊天通道
                 with self._task_cond:
-                    self.task_q.append(text)
+                    self.task_q.appendleft(text)
                     self._task_cond.notify()
                 self.save_state()
                 return
