@@ -1986,7 +1986,8 @@ class Bridge:
                 self._task_cond.notify()
             self.send_typing()
             preview = text[:50] + ("…" if len(text) > 50 else "")
-            self.send_weixin(f"收到，任务已入队（最新优先）：{preview}，会按顺序执行并实时报进度。")
+            queue_pos = len(self.task_q)  # 已 appendleft，长度含刚入队的自己
+            self.send_weixin(f"收到，任务已入队（最新优先，排第{queue_pos}）：{preview}，会按顺序执行并实时报进度。")
             self.save_state()
             return
         # 对话消息：新消息优先；若后台任务在跑，先打断它，任务处理完聊天后自动恢复
@@ -2160,6 +2161,11 @@ class Bridge:
             else:
                 prompt = memory_block + prompt
             prompt += TASK_PROTOCOL
+            # 任务主动汇报：开始/恢复执行时先告诉老板一声
+            if resume_sid:
+                self.send_weixin(f"🔄 继续处理刚才被打断的任务：{text[:40]}…")
+            else:
+                self.send_weixin(f"✅ 开始执行任务：{text[:40]}…")
             self._running_task.update({"sid": sid, "desc": text, "active": True, "req_id": None})
             cfg = self.backend_cfg or {}
             task_model = cfg.get("task_model") or TASK_MODEL
