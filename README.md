@@ -72,7 +72,7 @@ cd wechat-channel
 powershell -ExecutionPolicy Bypass -File scripts\Install.ps1
 ```
 
-脚本会自动检测 Python / Node / Codex，安装依赖、生成 `scripts/weixin_bridge/backend.json`，并引导扫码。之后：
+脚本会自动检测并补齐 Python / Node / Codex / codex-proxy，安装依赖、生成 `scripts/weixin_bridge/backend.json`、启动 codex-proxy 代理，并引导扫码。之后：
 
 ```powershell
 python scripts\wechat_bridge.py register   # 用机器人微信号扫码（不要用主号）
@@ -89,6 +89,19 @@ bash scripts/install.sh
 python scripts/wechat_bridge.py register
 python scripts/wechat_bridge.py run
 ```
+
+### Codex + DeepSeek 必须配 codex-proxy
+
+Codex CLI 走 OpenAI 的 Responses API，而 DeepSeek 只提供 Chat Completions API，**直连会失败**（DeepSeek 不认识 `/v1/responses`）。所以用 Codex 接 DeepSeek 时，必须本地跑一个 `codex-proxy` 做格式转换：
+
+```powershell
+npm install -g @lininn/codex-proxy   # 安装转换代理
+codex-proxy start                     # 启动（默认 4000 端口）
+```
+
+然后把 `~/.codex/config.toml` 里模型 provider 的 `base_url` 指向 `http://127.0.0.1:4000/v1`（Install.ps1 会自动检测并提示这一步）。codex-proxy 的 DeepSeek key 存在 `~/.codexproxy/config.json`，可用 `codex-proxy --web` 配置。
+
+> 用 Codex 配 OpenAI（原生 Responses API）、或直接用 Claude Code（Anthropic Messages）时，不需要 codex-proxy。
 
 ### 首次扫码绑定
 
@@ -107,6 +120,7 @@ python scripts/wechat_bridge.py env      # 打印环境与关键路径
 - `codex-acp`：与你的 `models.json` 的 `effort:max` 等配置经常冲突，会报 `unknown variant 'max'`。
 - `openclaw` 微信插件：不要与本桥共用同一个 iLink 机器人账号，会双 poller 抢消息、互踢登录。
 - 直接运行桌面版 `codex.exe`：WindowsApps 目录受系统保护，容易 `Access is denied`；用 npm 全局 `codex` 或 `~/.codex/bin/codex` 即可。
+- **直连 DeepSeek 不配 codex-proxy**：Codex 要 Responses API，DeepSeek 只有 Chat Completions，直连必失败；必须配 `@lininn/codex-proxy` 转换（见上）。
 
 ## 详细安装（手动）
 

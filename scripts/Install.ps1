@@ -114,6 +114,63 @@ if (Test-Path $modelsJson) {
     } catch {}
 }
 
+
+# ---------- codex-proxy（Codex + DeepSeek 必需：Responses API → Chat Completions 转换） ----------
+Write-Host ''
+Write-Host '--- codex-proxy (本地 Responses API 代理) ---' -ForegroundColor Cyan
+$env:Path = "C:\Program Files\nodejs;$env:APPDATA\npm;" + $env:Path
+$proxyExe = Get-Command codex-proxy -ErrorAction SilentlyContinue
+$proxyJs = Join-Path $env:APPDATA 'npm\node_modules\@lininn\codex-proxy\dist\src\cli.js'
+if (-not $proxyExe -and -not (Test-Path $proxyJs)) {
+    Write-Host 'codex-proxy 未安装，正在安装 @lininn/codex-proxy ...'
+    if (-not $node) { Write-Host '需要先安装 Node.js 18+' -ForegroundColor Red; exit 1 }
+    npm install -g @lininn/codex-proxy
+    if ($LASTEXITCODE -ne 0) { Write-Host 'codex-proxy 安装失败' -ForegroundColor Red; exit 1 }
+    $proxyExe = Get-Command codex-proxy -ErrorAction SilentlyContinue
+}
+
+$proxyConfig = Join-Path $HOME '.codexproxy\config.json'
+if (Test-Path $proxyConfig) {
+    Write-Host 'codex-proxy 配置: 已存在'
+} else {
+    $dk = $env:DEEPSEEK_API_KEY
+    if (-not $dk) { $dk = [Environment]::GetEnvironmentVariable('DEEPSEEK_API_KEY','User') }
+    if ($dk) {
+        Write-Host '检测到 DEEPSEEK_API_KEY，自动生成 codex-proxy 配置...'
+        $proxyProvider = @{ providerType = 'chat'; name = 'DeepSeek'; baseUrl = 'https://api.deepseek.com/v1'; apiKey = $dk; defaultModel = 'deepseek-chat' }
+        $proxyCfg = @{ port = 4000; defaultProvider = 'DeepSeek'; providers = @($proxyProvider) }
+        New-Item -ItemType Directory -Force -Path (Split-Path $proxyConfig) | Out-Null
+        $proxyCfg | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $proxyConfig -Encoding UTF8
+        Write-Host 'codex-proxy 配置已生成' -ForegroundColor Green
+    } else {
+        Write-Host 'codex-proxy 未配置，且未检测到 DEEPSEEK_API_KEY。' -ForegroundColor Yellow
+        Write-Host '  先执行: setx DEEPSEEK_API_KEY "sk-你的key"（重开终端后生效），再重跑本脚本。' -ForegroundColor Yellow
+    }
+}
+
+$proxyPort = Get-NetTCPConnection -LocalPort 4000 -ErrorAction SilentlyContinue
+if ($proxyPort) {
+    Write-Host 'codex-proxy 已在运行 (端口 4000)'
+} elseif ($proxyExe) {
+    codex-proxy start 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    Write-Host 'codex-proxy 已启动 (端口 4000)'
+} elseif (Test-Path $proxyJs) {
+    & $node $proxyJs start 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    Write-Host 'codex-proxy 已启动 (端口 4000)'
+}
+
+$configToml = Join-Path $HOME '.codex\config.toml'
+if (Test-Path $configToml) {
+    $toml = Get-Content $configToml -Raw -Encoding UTF8
+    if ($toml -match '127\.0\.0\.1:4000') {
+        Write-Host 'config.toml: 已指向 codex-proxy 代理 (127.0.0.1:4000/v1)' -ForegroundColor Green
+    } else {
+        Write-Host 'config.toml: 未指向代理。Codex 直连 DeepSeek 会失败（DeepSeek 只支持 Chat Completions，不支持 Responses API）。' -ForegroundColor Yellow
+        Write-Host '  请把 model_provider 指向走 127.0.0.1:4000/v1 的 provider（见 README）。' -ForegroundColor Yellow
+    }
+}
 # ---------- dirs ----------
 New-Item -ItemType Directory -Force -Path $bridgeDir | Out-Null
 New-Item -ItemType Directory -Force -Path $workDir | Out-Null

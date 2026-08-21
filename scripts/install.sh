@@ -63,6 +63,13 @@ if [ ! -f "$HOME/.codex/auth.json" ]; then
   echo "  Run: codex login  (or set provider/api key in ~/.codex/config.toml)"
 fi
 
+
+# codex-proxy (required for Codex + DeepSeek: Responses API -> Chat Completions)
+if ! command -v codex-proxy >/dev/null 2>&1; then
+  echo "WARNING: codex-proxy not found. Codex + DeepSeek needs it: npm install -g @lininn/codex-proxy"
+else
+  codex-proxy start >/dev/null 2>&1 || echo "codex-proxy start failed (check ~/.codexproxy/config.json)"
+fi
 echo
 echo "Setup complete."
 echo "Next steps:"
