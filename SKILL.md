@@ -9,10 +9,11 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 
 拿到新电脑或让另一个 Agent 部署时，按仓库 README「快速开始（开箱即用）」做，不要自由发挥：
 
-1. **Windows**：克隆仓库后跑 `powershell -ExecutionPolicy Bypass -File scripts\Install.ps1`，脚本自动检测 Python / Node / Codex、装 `pycryptodome`、生成 `weixin_bridge/backend.json`。
-2. 扫码：`python scripts\wechat_bridge.py register`（用机器人微信号，不要用主号）。
-3. 启动：`pythonw scripts\wechat_bridge.py run`（Windows）或 `python scripts/wechat_bridge.py run`（macOS/Linux）。
-4. 排障先跑 `python scripts/wechat_bridge.py doctor`，再跑 `status`。
+1. **装**：Windows 跑 `powershell -ExecutionPolicy Bypass -File scripts\Install.ps1`，macOS/Linux 跑 `bash scripts/install.sh`。脚本自动检测 Python / Node / Codex、装 `pycryptodome`、生成 `weixin_bridge/backend.json`。
+2. **登录 Codex**：先确认 `~/.codex/auth.json` 存在（或跑 `codex login`、在 `~/.codex/config.toml` 配好 provider/key）。未登录时桥能启动但 Codex 后端会报认证错误。
+3. **扫码**：`python scripts\wechat_bridge.py register`（用机器人微信号，不要用主号）。register 会打印终端 ASCII 二维码，并保存 PNG 到 `weixin_bridge/qrcode.png`——把这张图展示给用户扫码确认即可；终端乱码/显示不下时同样用 PNG。
+4. **启动**：`pythonw scripts\wechat_bridge.py run`（Windows）或 `python scripts/wechat_bridge.py run`（macOS/Linux）。
+5. **排障**：先跑 `python scripts/wechat_bridge.py doctor` 看环境，再跑 `status`；有问题看 `weixin_bridge/bridge.log` 尾部。
 
 **硬性反模式（新 Agent 最容易踩的坑）：**
 
@@ -20,6 +21,7 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 - 不要启用或依赖 `openclaw` 微信插件；它和本桥如果共用同一个 iLink 机器人账号会双 poller 抢消息、互踢登录。
 - 不要直接运行桌面版 `codex.exe`（WindowsApps 目录可能 `Access is denied`）；用 npm 全局 `codex` 或 `~/.codex/bin/codex`。
 - 遇到 `unknown variant 'max'` / `models.json` 解析失败，是 Codex CLI 版本与 `models.json` 里的 `effort:max` 不兼容；按 README 处理或用 `model_catalog_json` 指到去掉 `max` 的副本。
+
 ## 核心事实
 
 - 微信 AI 通道：`scripts/wechat_bridge.py` 是「微信桥」，用户微信私聊机器人 → iLink Bot API → 本机 Agent CLI（Codex / Claude / 任意 CLI）生成回复 → 回发微信。

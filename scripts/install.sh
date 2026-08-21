@@ -58,6 +58,11 @@ fi
 
 $PY -m pip install pycryptodome
 
+if [ ! -f "$HOME/.codex/auth.json" ]; then
+  echo "WARNING: Codex not logged in (~/.codex/auth.json missing)."
+  echo "  Run: codex login  (or set provider/api key in ~/.codex/config.toml)"
+fi
+
 echo
 echo "Setup complete."
 echo "Next steps:"

@@ -85,10 +85,14 @@ python scripts\wechat_bridge.py status      # 查看状态
 ```bash
 git clone https://github.com/li1bai0/wechat-channel.git
 cd wechat-channel
-pip install pycryptodome
+bash scripts/install.sh
 python scripts/wechat_bridge.py register
 python scripts/wechat_bridge.py run
 ```
+
+### 首次扫码绑定
+
+`register` 会在终端打印 ASCII 二维码，并保存 PNG 到 `weixin_bridge/qrcode.png`。用**当机器人的那个微信号**扫码确认（不要用你自己的主号）。终端显示不下或乱码时，直接把 `qrcode.png` 展示给用户扫码；二维码几分钟过期，脚本会自动刷新（最多 3 次）。
 
 ### 排障入口
 

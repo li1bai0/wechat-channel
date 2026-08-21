@@ -23,15 +23,6 @@ Write-Host '=====================================================' -ForegroundCo
 Write-Host "repo : $repo"
 Write-Host ''
 
-function Find-Cmd($name) {
-    $c = Get-Command $name -ErrorAction SilentlyContinue
-    if ($c) { return (($c.Source -replace '\.cmd$', '') + (if ($c.CommandType -eq 'Application') { $c.Path } else { $c.Source })) }
-    # simpler: return first non-empty of Path/Source
-    if ($c.Path) { return $c.Path }
-    if ($c.Source) { return $c.Source }
-    return $null
-}
-
 # ---------- python ----------
 $python = $null
 $pt = Get-Command python -ErrorAction SilentlyContinue
@@ -163,6 +154,13 @@ if (-not $NoDeps) {
 # ---------- summary ----------
 Write-Host ''
 Write-Host 'Setup complete.' -ForegroundColor Green
+
+# codex login check
+$authJson = Join-Path $HOME '.codex\auth.json'
+if (-not (Test-Path $authJson)) {
+    Write-Host 'WARNING: Codex not logged in (~/.codex/auth.json missing).' -ForegroundColor Yellow
+    Write-Host '  Run: codex login   (or set provider/api key in ~/.codex/config.toml)' -ForegroundColor Yellow
+}
 if ($modelsHint) { Write-Host "models.json: $modelsHint" -ForegroundColor Yellow }
 Write-Host ''
 Write-Host 'Next steps:'
