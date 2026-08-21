@@ -66,9 +66,9 @@
 
 ### 开始前准备（先备齐，否则后面会卡）
 
-1. **DeepSeek API key**（用 Codex + DeepSeek 必须）：先设置环境变量，`setx DEEPSEEK_API_KEY "sk-你的key"`，然后**重开终端**再跑下面的脚本。没有 key，codex-proxy 就算装好了也转不通 DeepSeek。
-2. **一个当机器人的微信号**（扫码登录用，不要用你自己的主号）。
-3. **Codex 已登录**（用 Codex 后端时）：`codex login`，或已有 `~/.codex/auth.json`。
+1. **装好并登录你要用的 Agent**：Codex 后端跑 `codex login`；Claude 后端跑 `claude login`（或设 `ANTHROPIC_API_KEY`）；generic 后端装好对应 CLI。
+2. **对应的模型 API key**：Codex 默认接 OpenAI（原生 Responses API，无需额外转换）；**只有当你像我们一样用 Codex 接 DeepSeek 时**，才需要 `DEEPSEEK_API_KEY` + codex-proxy（见下）。
+3. **一个当机器人的微信号**（扫码登录用，不要用你自己的主号）。
 
 ### Windows
 
@@ -78,7 +78,7 @@ cd wechat-channel
 powershell -ExecutionPolicy Bypass -File scripts\Install.ps1
 ```
 
-脚本会自动检测并补齐 Python / Node / Codex / codex-proxy，安装依赖、生成 `scripts/weixin_bridge/backend.json`、启动 codex-proxy 代理，并引导扫码。之后：
+脚本会自动检测并补齐 Python / Node / Codex，安装依赖、生成 `scripts/weixin_bridge/backend.json` 并引导扫码；如果检测到你用 Codex + DeepSeek，还会自动装并启动 codex-proxy。之后：
 
 ```powershell
 python scripts\wechat_bridge.py register   # 用机器人微信号扫码（不要用主号）
@@ -96,9 +96,9 @@ python scripts/wechat_bridge.py register
 python scripts/wechat_bridge.py run
 ```
 
-### Codex + DeepSeek 必须配 codex-proxy
+### 仅 Codex + DeepSeek 需要：codex-proxy（其他组合跳过）
 
-Codex CLI 走 OpenAI 的 Responses API，而 DeepSeek 只提供 Chat Completions API，**直连会失败**（DeepSeek 不认识 `/v1/responses`）。所以用 Codex 接 DeepSeek 时，必须本地跑一个 `codex-proxy` 做格式转换：
+**只有用 Codex 后端、且模型是 DeepSeek 时，才需要这一步**。Codex CLI 走 OpenAI 的 Responses API，而 DeepSeek 只提供 Chat Completions API，**直连会失败**（DeepSeek 不认识 `/v1/responses`），所以要本地跑一个 `codex-proxy` 做格式转换：
 
 ```powershell
 npm install -g @lininn/codex-proxy   # 安装转换代理

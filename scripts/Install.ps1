@@ -115,9 +115,20 @@ if (Test-Path $modelsJson) {
 }
 
 
-# ---------- codex-proxy（Codex + DeepSeek 必需：Responses API → Chat Completions 转换） ----------
+# ---------- codex-proxy（仅 Codex + DeepSeek 需要；OpenAI/Claude 跳过） ----------
 Write-Host ''
-Write-Host '--- codex-proxy (本地 Responses API 代理) ---' -ForegroundColor Cyan
+$needProxy = $false
+$configTomlCheck = Join-Path $HOME '.codex\config.toml'
+if (Test-Path $configTomlCheck) {
+    $tomlChk = Get-Content $configTomlCheck -Raw -Encoding UTF8
+    if ($tomlChk -match 'deepseek|DeepSeek|127\.0\.0\.1:4000') { $needProxy = $true }
+} else {
+    $needProxy = $true  # 没有 config.toml 时按项目默认 DeepSeek 处理
+}
+if (-not $needProxy) {
+    Write-Host '检测到非 DeepSeek 模型（如 OpenAI），跳过 codex-proxy。' -ForegroundColor Green
+} else {
+Write-Host '--- codex-proxy (Codex + DeepSeek 的 Responses API 代理) ---' -ForegroundColor Cyan
 $env:Path = "C:\Program Files\nodejs;$env:APPDATA\npm;" + $env:Path
 $proxyExe = Get-Command codex-proxy -ErrorAction SilentlyContinue
 $proxyJs = Join-Path $env:APPDATA 'npm\node_modules\@lininn\codex-proxy\dist\src\cli.js'
@@ -170,6 +181,7 @@ if (Test-Path $configToml) {
         Write-Host 'config.toml: 未指向代理。Codex 直连 DeepSeek 会失败（DeepSeek 只支持 Chat Completions，不支持 Responses API）。' -ForegroundColor Yellow
         Write-Host '  请把 model_provider 指向走 127.0.0.1:4000/v1 的 provider（见 README）。' -ForegroundColor Yellow
     }
+}
 }
 # ---------- dirs ----------
 New-Item -ItemType Directory -Force -Path $bridgeDir | Out-Null
