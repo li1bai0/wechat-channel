@@ -1,11 +1,4 @@
 __pycache__/
 *.pyc
 wechat_work/
-weixin_bridge/account.json
-weixin_bridge/backend.json
-weixin_bridge/state.json
-weixin_bridge/bridge.log
-weixin_bridge/bridge.lock
-weixin_bridge/retry_queue.jsonl
-weixin_bridge/qrcode.png
-weixin_bridge/accounts/
+scripts/weixin_bridge/

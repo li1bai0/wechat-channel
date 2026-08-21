@@ -12,7 +12,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$bridgeDir = Join-Path $repo 'weixin_bridge'
+$bridgeDir = Join-Path $PSScriptRoot 'weixin_bridge'
 $workDir = Join-Path $repo 'wechat_work'
 $backendPath = Join-Path $bridgeDir 'backend.json'
 

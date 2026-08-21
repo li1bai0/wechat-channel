@@ -72,7 +72,7 @@ cd wechat-channel
 powershell -ExecutionPolicy Bypass -File scripts\Install.ps1
 ```
 
-脚本会自动检测 Python / Node / Codex，安装依赖、生成 `weixin_bridge/backend.json`，并引导扫码。之后：
+脚本会自动检测 Python / Node / Codex，安装依赖、生成 `scripts/weixin_bridge/backend.json`，并引导扫码。之后：
 
 ```powershell
 python scripts\wechat_bridge.py register   # 用机器人微信号扫码（不要用主号）
@@ -92,7 +92,7 @@ python scripts/wechat_bridge.py run
 
 ### 首次扫码绑定
 
-`register` 会在终端打印 ASCII 二维码，并保存 PNG 到 `weixin_bridge/qrcode.png`。用**当机器人的那个微信号**扫码确认（不要用你自己的主号）。终端显示不下或乱码时，直接把 `qrcode.png` 展示给用户扫码；二维码几分钟过期，脚本会自动刷新（最多 3 次）。
+`register` 会在终端打印 ASCII 二维码，并保存 PNG 到 `scripts/weixin_bridge/qrcode.png`。用**当机器人的那个微信号**扫码确认（不要用你自己的主号）。终端显示不下或乱码时，直接把 `qrcode.png` 展示给用户扫码；二维码几分钟过期，脚本会自动刷新（最多 3 次）。
 
 ### 排障入口
 
@@ -129,7 +129,7 @@ powershell -ExecutionPolicy Bypass -File scripts\Install.ps1      # Windows
 # 或：pip install pycryptodome                                    # macOS/Linux
 ```
 
-Windows 跑完脚本会自动生成 `weixin_bridge/backend.json`（并探测 Codex 路径）。如果想手动创建，参考 `scripts/backend.example.json`；路径也可以省略，桥会自动在常见安装位置探测；`work_dir` 不填时默认用脚本旁的 `wechat_work/`。
+Windows 跑完脚本会自动生成 `scripts/weixin_bridge/backend.json`（并探测 Codex 路径）。如果想手动创建，参考 `scripts/backend.example.json`；路径也可以省略，桥会自动在常见安装位置探测；`work_dir` 不填时默认用仓库根下的 `wechat_work/`。
 
 ### 2. 扫码绑定
 
@@ -137,7 +137,7 @@ Windows 跑完脚本会自动生成 `weixin_bridge/backend.json`（并探测 Cod
 python scripts/wechat_bridge.py register
 ```
 
-终端输出二维码（并生成 PNG），用微信扫码确认，成功后写入 `weixin_bridge/account.json`。
+终端输出二维码（并生成 PNG），用微信扫码确认，成功后写入 `scripts/weixin_bridge/account.json`。
 
 ### 3. 启动
 
@@ -150,7 +150,7 @@ Windows 建议用 `pythonw` 后台运行，并配合任务计划/守护脚本保
 
 ### 切换后端
 
-编辑 `weixin_bridge/backend.json` 的 `backend` 字段，重启桥：
+编辑 `scripts/weixin_bridge/backend.json` 的 `backend` 字段，重启桥：
 
 - `"backend": "codex"` → Codex
 - `"backend": "claude"` → Claude Code（需要 Claude 登录或 ANTHROPIC_API_KEY）

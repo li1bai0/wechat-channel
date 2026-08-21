@@ -644,9 +644,12 @@ def _probe_codex_provider(timeout=5):
         return True
     if not urls:
         return True
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     for u in urls:
         try:
-            with urllib.request.urlopen(urllib.request.Request(u.rstrip("/") + "/models"), timeout=timeout) as r:
+            req = urllib.request.Request(u.rstrip("/") + "/models", headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
                 if r.status == 200:
                     return True
         except Exception:

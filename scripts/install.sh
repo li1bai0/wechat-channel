@@ -3,7 +3,7 @@
 # Usage: bash scripts/install.sh
 set -euo pipefail
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-BRIDGE_DIR="$REPO/weixin_bridge"
+BRIDGE_DIR="$(cd "$(dirname "$0")" && pwd)/weixin_bridge"
 WORK_DIR="$REPO/wechat_work"
 BACKEND_PATH="$BRIDGE_DIR/backend.json"
 

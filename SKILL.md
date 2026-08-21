@@ -9,11 +9,11 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 
 拿到新电脑或让另一个 Agent 部署时，按仓库 README「快速开始（开箱即用）」做，不要自由发挥：
 
-1. **装**：Windows 跑 `powershell -ExecutionPolicy Bypass -File scripts\Install.ps1`，macOS/Linux 跑 `bash scripts/install.sh`。脚本自动检测 Python / Node / Codex、装 `pycryptodome`、生成 `weixin_bridge/backend.json`。
+1. **装**：Windows 跑 `powershell -ExecutionPolicy Bypass -File scripts\Install.ps1`，macOS/Linux 跑 `bash scripts/install.sh`。脚本自动检测 Python / Node / Codex、装 `pycryptodome`、生成 `scripts/weixin_bridge/backend.json`。
 2. **登录 Codex**：先确认 `~/.codex/auth.json` 存在（或跑 `codex login`、在 `~/.codex/config.toml` 配好 provider/key）。未登录时桥能启动但 Codex 后端会报认证错误。
-3. **扫码**：`python scripts\wechat_bridge.py register`（用机器人微信号，不要用主号）。register 会打印终端 ASCII 二维码，并保存 PNG 到 `weixin_bridge/qrcode.png`——把这张图展示给用户扫码确认即可；终端乱码/显示不下时同样用 PNG。
+3. **扫码**：`python scripts\wechat_bridge.py register`（用机器人微信号，不要用主号）。register 会打印终端 ASCII 二维码，并保存 PNG 到 `scripts/weixin_bridge/qrcode.png`——把这张图展示给用户扫码确认即可；终端乱码/显示不下时同样用 PNG。
 4. **启动**：`pythonw scripts\wechat_bridge.py run`（Windows）或 `python scripts/wechat_bridge.py run`（macOS/Linux）。
-5. **排障**：先跑 `python scripts/wechat_bridge.py doctor` 看环境，再跑 `status`；有问题看 `weixin_bridge/bridge.log` 尾部。
+5. **排障**：先跑 `python scripts/wechat_bridge.py doctor` 看环境，再跑 `status`；有问题看 `scripts/weixin_bridge/bridge.log` 尾部。
 
 **硬性反模式（新 Agent 最容易踩的坑）：**
 
@@ -29,7 +29,7 @@ description: 微信 AI 通道（多 Agent 微信桥）运维指南：检查桥�
 - 常驻连接（2026-08-15 起 Codex / Claude 均常驻）：Codex 走 app-server + WebSocket 长连接；Claude 走 `scripts/claude_helper.py`（官方 Agent SDK 保持常驻 claude 子进程，`pip install claude-agent-sdk`）。两者都不再每条消息冷启动，多轮对话复用同一进程/线程，续聊不丢上下文。
 - 关键路径：
   - 桥脚本：`scripts/wechat_bridge.py`
-  - 桥数据目录：`weixin_bridge/`（`account.json`、`state.json`、`bridge.log`、`backend.json`）
+  - 桥数据目录：`scripts/weixin_bridge/`（`account.json`、`state.json`、`bridge.log`、`backend.json`）
   - 工作目录：`backend.json` 的 `work_dir`（默认仓库下 `wechat_work/`）
   - 看护：由部署方配置守护脚本保活
 

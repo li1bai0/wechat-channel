@@ -1,8 +1,6 @@
 $ErrorActionPreference = 'SilentlyContinue'
-$base = Join-Path $PSScriptRoot '..\weixin_bridge'
-if (-not (Test-Path -LiteralPath $base)) {
-    $base = 'C:\Users\<you>\wechat_work\weixin_bridge'
-}
+$base = Join-Path $PSScriptRoot 'weixin_bridge'
+
 $logFile = Join-Path $base 'bridge.log'
 $stateFile = Join-Path $base 'state.json'
 $accountFile = Join-Path $base 'account.json'
