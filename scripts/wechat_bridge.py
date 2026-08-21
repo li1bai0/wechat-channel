@@ -988,15 +988,24 @@ def _cut_paragraph(text, max_len):
                     start = n
                     continue
                 if remain > max_len:
-                    # 优先在自然断点切（句末/句中标点/空格），别把完整内容从中硬切
+                    # 在最合适的地方切：优先句末标点，其次句中标点，再其次空格
                     end = start + max_len
                     cut = None
                     for i in range(end, start + max_len // 2, -1):
-                        if p[i - 1] in "。！？；，、：!?;,: ":
+                        if p[i - 1] in "。！？；!?;":
                             cut = i
                             break
                     if cut is None:
-                        cut = end
+                        for i in range(end, start + max_len // 2, -1):
+                            if p[i - 1] in "，、：,: ":
+                                cut = i
+                                break
+                    if cut is None:
+                        # 无任何自然断点：超得不多就整段保留，避免乱切
+                        if remain <= int(max_len * 1.3):
+                            cut = n
+                        else:
+                            cut = end
                     chunks.append(p[start:cut])
                     start = cut
                 else:
