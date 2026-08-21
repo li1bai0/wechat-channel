@@ -1,0 +1,67 @@
+#!/usr/bin/env bash
+# wechat-channel setup for macOS/Linux
+# Usage: bash scripts/install.sh
+set -euo pipefail
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+BRIDGE_DIR="$REPO/weixin_bridge"
+WORK_DIR="$REPO/wechat_work"
+BACKEND_PATH="$BRIDGE_DIR/backend.json"
+
+echo "== wechat-channel setup (macOS/Linux) =="
+echo "repo: $REPO"
+
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "python3 not found. Install Python 3.10+ first." >&2
+  exit 1
+fi
+PY="$(command -v python3)"
+$PY -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)'
+
+echo "python: $PY"
+
+if ! command -v node >/dev/null 2>&1; then
+  echo "node not found. Codex backend needs Node 18+." >&2
+fi
+
+if command -v codex >/dev/null 2>&1; then
+  CODEX="$(command -v codex)"
+  echo "codex: $CODEX"
+fi
+
+mkdir -p "$BRIDGE_DIR"
+mkdir -p "$WORK_DIR"
+
+if [ ! -f "$BACKEND_PATH" ]; then
+  cat > "$BACKEND_PATH" <<EOF
+{
+  "backend": "codex",
+  "node_exe": "",
+  "codex_js": "",
+  "claude_exe": "",
+  "work_dir": "$WORK_DIR",
+  "chat_model": "deepseek-v4-flash",
+  "chat_effort": "medium",
+  "casual_effort": "low",
+  "task_model": "deepseek-v4-flash",
+  "task_effort": "medium",
+  "generic": {
+    "new_cmd": ["myagent", "-p", "{prompt}"],
+    "resume_cmd": ["myagent", "-p", "{prompt}", "-s", "{session}"],
+    "session_regex": "session[=_ ]([0-9a-fA-F-]{8,})"
+  }
+}
+EOF
+  echo "created backend.json: $BACKEND_PATH"
+else
+  echo "backend.json already exists: $BACKEND_PATH"
+fi
+
+$PY -m pip install pycryptodome
+
+echo
+echo "Setup complete."
+echo "Next steps:"
+echo "  python scripts/wechat_bridge.py register   # scan QR with the bot WeChat account"
+echo "  python scripts/wechat_bridge.py run        # persistent bridge"
+echo "  python scripts/wechat_bridge.py status     # check status"
+echo

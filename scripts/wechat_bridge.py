@@ -2447,12 +2447,59 @@ def status():
     return 0
 
 
+
+
+def doctor():
+    """自检环境：python/node/codex/依赖/数据文件/后端配置（不修改状态）。"""
+    print("== wechat-channel doctor ==")
+    print(f"python: {sys.version.split()[0]}")
+    print(f"data_dir: {DATA_DIR}")
+    print(f"script: {Path(__file__).resolve()}")
+    try:
+        import Crypto
+        print(f"pycryptodome: OK ({Crypto.__version__})")
+    except Exception as e:
+        print(f"pycryptodome: MISSING ({e})")
+    print(f"node: {CODEX_NODE if os.path.exists(CODEX_NODE) else 'NOT FOUND'}")
+    print(f"codex: {CODEX_JS if os.path.exists(CODEX_JS) else 'NOT FOUND'}")
+    print(f"claude: {CLAUDE_EXE if os.path.exists(CLAUDE_EXE) else 'not set / not found'}")
+    print(f"work_dir: {CODEX_WORK_DIR}")
+    print(f"backend_file: {BACKEND_FILE if BACKEND_FILE.exists() else 'MISSING'}")
+    backend, _ = _load_backend()
+    print(f"backend: {backend}")
+    if ACCOUNT_FILE.exists():
+        acc = json.loads(ACCOUNT_FILE.read_text(encoding='utf-8'))
+        print(f"account: {acc.get('account_id')} saved_at={acc.get('saved_at')}")
+    else:
+        print("account: NOT REGISTERED (run: python wechat_bridge.py register)")
+    if LOCK_FILE.exists():
+        print(f"lock_pid: {LOCK_FILE.read_text(encoding='utf-8').strip()}")
+    return 0
+
+
+def env_cmd():
+    """打印环境相关关键信息（给排障/日志处理用）。"""
+    print("== wechat-channel env ==")
+    print(f"PATH: {os.environ.get('PATH', '')}")
+    print(f"APPDATA: {os.environ.get('APPDATA', '')}")
+    print(f"HOME: {os.path.expanduser('~')}")
+    print(f"node: {CODEX_NODE}")
+    print(f"codex: {CODEX_JS}")
+    print(f"claude: {CLAUDE_EXE}")
+    return 0
+
+
 def main():
+
     cmd = sys.argv[1] if len(sys.argv) > 1 else "run"
     if cmd == "register":
         return register()
     if cmd == "status":
         return status()
+    if cmd == "doctor":
+        return doctor()
+    if cmd == "env":
+        return env_cmd()
     if not ACCOUNT_FILE.exists():
         print("未注册。先执行: python wechat_bridge.py register")
         return 1

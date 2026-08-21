@@ -60,7 +60,51 @@
 
 桥负责：收发消息、扫码绑定、消息分级、进度转发、文件互传、会话管理、稳定性兜底。Agent 只负责干活。
 
-## 快速开始
+## 快速开始（开箱即用）
+
+> 新电脑 / 新 Agent 优先走这条路径。**不要**自行安装 `wechat-acp-codex`、`codex-acp`、`openclaw` 微信插件，本项目自带桥 `scripts/wechat_bridge.py`，不需要 ACP/第三方桥。
+
+### Windows
+
+```powershell
+git clone https://github.com/li1bai0/wechat-channel.git
+cd wechat-channel
+powershell -ExecutionPolicy Bypass -File scripts\Install.ps1
+```
+
+脚本会自动检测 Python / Node / Codex，安装依赖、生成 `weixin_bridge/backend.json`，并引导扫码。之后：
+
+```powershell
+python scripts\wechat_bridge.py register   # 用机器人微信号扫码（不要用主号）
+pythonw scripts\wechat_bridge.py run        # 后台启动常驻桥
+python scripts\wechat_bridge.py status      # 查看状态
+```
+
+### macOS / Linux
+
+```bash
+git clone https://github.com/li1bai0/wechat-channel.git
+cd wechat-channel
+pip install pycryptodome
+python scripts/wechat_bridge.py register
+python scripts/wechat_bridge.py run
+```
+
+### 排障入口
+
+```bash
+python scripts/wechat_bridge.py doctor   # 一次打印 python/node/codex/依赖/账号/backend 情况
+python scripts/wechat_bridge.py env      # 打印环境与关键路径
+```
+
+### 不要用它（常见踩坑）
+
+- `wechat-acp-codex`：第三方 npm 桥，需要 ACP 适配器，且 `@zed-industries/codex-acp` 已废弃；缺本项目已有的文件回传、任务/聊天车道、进度兜底、桥记忆等能力。
+- `codex-acp`：与你的 `models.json` 的 `effort:max` 等配置经常冲突，会报 `unknown variant 'max'`。
+- `openclaw` 微信插件：不要与本桥共用同一个 iLink 机器人账号，会双 poller 抢消息、互踢登录。
+- 直接运行桌面版 `codex.exe`：WindowsApps 目录受系统保护，容易 `Access is denied`；用 npm 全局 `codex` 或 `~/.codex/bin/codex` 即可。
+
+## 详细安装（手动）
 
 ### 环境要求
 
@@ -77,10 +121,11 @@
 ```bash
 git clone https://github.com/li1bai0/wechat-channel.git
 cd wechat-channel
-pip install pycryptodome
+powershell -ExecutionPolicy Bypass -File scripts\Install.ps1      # Windows
+# 或：pip install pycryptodome                                    # macOS/Linux
 ```
 
-把 `scripts/backend.example.json` 复制为 `weixin_bridge/backend.json` 并按本机路径修改。路径也可以省略，桥会自动在常见安装位置探测；`work_dir` 不填时默认用脚本旁的 `wechat_work/`。
+Windows 跑完脚本会自动生成 `weixin_bridge/backend.json`（并探测 Codex 路径）。如果想手动创建，参考 `scripts/backend.example.json`；路径也可以省略，桥会自动在常见安装位置探测；`work_dir` 不填时默认用脚本旁的 `wechat_work/`。
 
 ### 2. 扫码绑定
 
