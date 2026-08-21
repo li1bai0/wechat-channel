@@ -64,6 +64,12 @@
 
 > 新电脑 / 新 Agent 优先走这条路径。**不要**自行安装 `wechat-acp-codex`、`codex-acp`、`openclaw` 微信插件，本项目自带桥 `scripts/wechat_bridge.py`，不需要 ACP/第三方桥。
 
+### 开始前准备（先备齐，否则后面会卡）
+
+1. **DeepSeek API key**（用 Codex + DeepSeek 必须）：先设置环境变量，`setx DEEPSEEK_API_KEY "sk-你的key"`，然后**重开终端**再跑下面的脚本。没有 key，codex-proxy 就算装好了也转不通 DeepSeek。
+2. **一个当机器人的微信号**（扫码登录用，不要用你自己的主号）。
+3. **Codex 已登录**（用 Codex 后端时）：`codex login`，或已有 `~/.codex/auth.json`。
+
 ### Windows
 
 ```powershell
