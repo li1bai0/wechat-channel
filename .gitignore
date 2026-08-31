@@ -1,0 +1,27 @@
+__pycache__/
+*.pyc
+wechat_work/
+scripts/weixin_bridge/
+
+# Local credentials, sessions, logs and private personas
+**/account.json
+**/state.json
+**/backend.json
+!scripts/backend.example.json
+**/persona.json
+**/auth.json
+**/config.toml
+**/*.log
+**/qrcode*.png
+**/retry_queue*.jsonl
+**/build.json
+**/inbox/
+**/backups/
+.env
+.env.*
+!.env.example
+
+# Agent-local notes and editor/runtime state
+.agents/
+.codex/
+.claude/
